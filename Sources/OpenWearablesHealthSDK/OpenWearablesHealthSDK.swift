@@ -432,15 +432,17 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
     ///
     /// Incremental sync (``syncNow``) only returns samples inserted after the saved
     /// anchor, so samples written to HealthKit late for recent days are never re-read
-    /// once the anchor has advanced past them. Call this periodically (e.g. once a
-    /// day, alongside background sync) to re-upload the trailing `daysBack` window;
-    /// the server upserts, so duplicates are harmless and partial days fill in.
-    /// Anchors, the sync session and the outbox are left untouched.
+    /// once the anchor has advanced past them. Call this periodically (alongside
+    /// background sync) with the timestamp of the previous catch-up minus a small
+    /// overlap, to re-upload everything since then; the server upserts, so duplicates
+    /// are harmless and partial days fill in. Anchors, the sync session and the
+    /// outbox are left untouched.
     ///
     /// - Parameters:
-    ///   - daysBack: Calendar days to re-read, from the start of that day to now. Minimum 1.
+    ///   - sinceMillis: Unix epoch in milliseconds; samples with a start date at or
+    ///     after this are re-read up to now. The caller passes (lastSyncedAt - overlap).
     ///   - completion: Called with `true` when the window upload was enqueued (or there was nothing to send).
-    public func syncRecentWindow(daysBack: Int = 1, completion: @escaping (Bool) -> Void) {
+    public func syncRecentWindow(sinceMillis: Double, completion: @escaping (Bool) -> Void) {
         guard userId != nil, hasAuth, let endpoint = syncEndpoint, let credential = authCredential else {
             logMessage("syncRecentWindow: not signed in")
             completion(false)
@@ -458,8 +460,7 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
             return
         }
 
-        let calendar = Calendar.current
-        let start = calendar.date(byAdding: .day, value: -max(daysBack, 1), to: calendar.startOfDay(for: Date())) ?? Date()
+        let start = Date(timeIntervalSince1970: max(sinceMillis, 0) / 1000.0)
         let predicate = HKQuery.predicateForSamples(withStart: start, end: nil, options: [])
         logMessage("syncRecentWindow: re-reading \(types.count) types since \(start)")
 
