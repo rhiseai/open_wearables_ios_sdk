@@ -427,6 +427,88 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         }
     }
     
+    /// Re-read a recent window of HealthKit data with a non-anchored query and
+    /// enqueue it for upload, independently of the anchor-based incremental sync.
+    ///
+    /// Incremental sync (``syncNow``) only returns samples inserted after the saved
+    /// anchor, so samples written to HealthKit late for recent days are never re-read
+    /// once the anchor has advanced past them. Call this periodically (e.g. once a
+    /// day, alongside background sync) to re-upload the trailing `daysBack` window;
+    /// the server upserts, so duplicates are harmless and partial days fill in.
+    /// Anchors, the sync session and the outbox are left untouched.
+    ///
+    /// - Parameters:
+    ///   - daysBack: Calendar days to re-read, from the start of that day to now. Minimum 1.
+    ///   - completion: Called with `true` when the window upload was enqueued (or there was nothing to send).
+    public func syncRecentWindow(daysBack: Int = 1, completion: @escaping (Bool) -> Void) {
+        guard userId != nil, hasAuth, let endpoint = syncEndpoint, let credential = authCredential else {
+            logMessage("syncRecentWindow: not signed in")
+            completion(false)
+            return
+        }
+        guard HKHealthStore.isHealthDataAvailable() else {
+            logMessage("syncRecentWindow: HealthKit not available")
+            completion(false)
+            return
+        }
+        let types = getQueryableTypes()
+        guard !types.isEmpty else {
+            logMessage("syncRecentWindow: no queryable types")
+            completion(false)
+            return
+        }
+
+        let calendar = Calendar.current
+        let start = calendar.date(byAdding: .day, value: -max(daysBack, 1), to: calendar.startOfDay(for: Date())) ?? Date()
+        let predicate = HKQuery.predicateForSamples(withStart: start, end: nil, options: [])
+        logMessage("syncRecentWindow: re-reading \(types.count) types since \(start)")
+
+        let collectLock = NSLock()
+        var collected: [HKSample] = []
+        let group = DispatchGroup()
+
+        for type in types {
+            group.enter()
+            let query = HKSampleQuery(
+                sampleType: type,
+                predicate: predicate,
+                limit: HKObjectQueryNoLimit,
+                sortDescriptors: nil
+            ) { [weak self] _, samples, error in
+                if let error = error {
+                    self?.logMessage("syncRecentWindow: \(self?.shortTypeName(type.identifier) ?? type.identifier) error: \(error.localizedDescription)")
+                }
+                if let samples = samples, !samples.isEmpty {
+                    collectLock.lock()
+                    collected.append(contentsOf: samples)
+                    collectLock.unlock()
+                }
+                group.leave()
+            }
+            healthStore.execute(query)
+        }
+
+        group.notify(queue: DispatchQueue.global()) { [weak self] in
+            guard let self = self else { completion(false); return }
+            guard !collected.isEmpty else {
+                self.logMessage("syncRecentWindow: nothing to re-upload")
+                completion(true)
+                return
+            }
+            let payload = self.serializeCombinedStreaming(samples: collected)
+            self.enqueueCombinedUpload(
+                payload: payload,
+                anchors: [:],
+                endpoint: endpoint,
+                credential: credential,
+                wasFullExport: false
+            ) { ok in
+                self.logMessage("syncRecentWindow: enqueued \(collected.count) samples (ok=\(ok))")
+                completion(ok)
+            }
+        }
+    }
+
     /// Get stored credentials.
     public func getStoredCredentials() -> [String: Any?] {
         return [
