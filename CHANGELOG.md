@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.13.0.1
+
+* **Rhise fork patch**: added HealthKit quantity types `basalBodyTemperature`, `dietaryFiber`, `dietarySugar`, and `dietaryCaffeine` (authorization + sync + default units). Fork version uses a fourth semver segment so it will not collide with a future upstream `0.14.0`.
+
 ## 0.13.0
 
 * **Sync telemetry**: new `/logs` endpoint integration for initial full sync diagnostics.
