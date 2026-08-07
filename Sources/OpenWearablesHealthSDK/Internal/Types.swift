@@ -42,6 +42,7 @@ public enum HealthDataType: String, CaseIterable, Sendable {
     case leanBodyMass
     case waistCircumference
     case bodyTemperature
+    case basalBodyTemperature
     
     // Blood & Metabolic
     case bloodGlucose
@@ -66,6 +67,9 @@ public enum HealthDataType: String, CaseIterable, Sendable {
     case dietaryProtein
     case dietaryFatTotal
     case dietaryWater
+    case dietaryFiber
+    case dietarySugar
+    case dietaryCaffeine
     
     // Running Dynamics (iOS 16.0+) — sensor-derived, not computable from distance/steps
     case runningPower
@@ -144,6 +148,8 @@ public enum HealthDataType: String, CaseIterable, Sendable {
             return nil
         case .bodyTemperature:
             return HKObjectType.quantityType(forIdentifier: .bodyTemperature)
+        case .basalBodyTemperature:
+            return HKObjectType.quantityType(forIdentifier: .basalBodyTemperature)
         case .bloodGlucose:
             return HKObjectType.quantityType(forIdentifier: .bloodGlucose)
         case .insulinDelivery:
@@ -179,6 +185,12 @@ public enum HealthDataType: String, CaseIterable, Sendable {
             return HKObjectType.quantityType(forIdentifier: .dietaryFatTotal)
         case .dietaryWater:
             return HKObjectType.quantityType(forIdentifier: .dietaryWater)
+        case .dietaryFiber:
+            return HKObjectType.quantityType(forIdentifier: .dietaryFiber)
+        case .dietarySugar:
+            return HKObjectType.quantityType(forIdentifier: .dietarySugar)
+        case .dietaryCaffeine:
+            return HKObjectType.quantityType(forIdentifier: .dietaryCaffeine)
         case .runningPower:
             if #available(iOS 16.0, *) {
                 return HKObjectType.quantityType(forIdentifier: .runningPower)
@@ -329,7 +341,8 @@ extension OpenWearablesHealthSDK {
         case HKObjectType.quantityType(forIdentifier: .bodyMass),
              HKObjectType.quantityType(forIdentifier: .height):
             return .meter()
-        case HKObjectType.quantityType(forIdentifier: .bodyTemperature):
+        case HKObjectType.quantityType(forIdentifier: .bodyTemperature),
+             HKObjectType.quantityType(forIdentifier: .basalBodyTemperature):
             return .degreeCelsius()
         case HKObjectType.quantityType(forIdentifier: .oxygenSaturation):
             return HKUnit.percent()
@@ -412,7 +425,8 @@ extension OpenWearablesHealthSDK {
             return (.gramUnit(with: .kilo), "kg")
         case HKObjectType.quantityType(forIdentifier: .waistCircumference):
             return (.meter(), "m")
-        case HKObjectType.quantityType(forIdentifier: .bodyTemperature):
+        case HKObjectType.quantityType(forIdentifier: .bodyTemperature),
+             HKObjectType.quantityType(forIdentifier: .basalBodyTemperature):
             return (.degreeCelsius(), "degC")
         case HKObjectType.quantityType(forIdentifier: .oxygenSaturation):
             return (HKUnit.percent(), "%")
@@ -433,8 +447,12 @@ extension OpenWearablesHealthSDK {
             return (.count(), "count")
         case HKObjectType.quantityType(forIdentifier: .dietaryCarbohydrates),
              HKObjectType.quantityType(forIdentifier: .dietaryProtein),
-             HKObjectType.quantityType(forIdentifier: .dietaryFatTotal):
+             HKObjectType.quantityType(forIdentifier: .dietaryFatTotal),
+             HKObjectType.quantityType(forIdentifier: .dietaryFiber),
+             HKObjectType.quantityType(forIdentifier: .dietarySugar):
             return (.gram(), "g")
+        case HKObjectType.quantityType(forIdentifier: .dietaryCaffeine):
+            return (.gramUnit(with: .milli), "mg")
         case HKObjectType.quantityType(forIdentifier: .dietaryWater):
             return (.liter(), "L")
         default:

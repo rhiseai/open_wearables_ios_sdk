@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+* **Rhise fork health types**: authorize and sync `basalBodyTemperature`, `dietaryFiber`, `dietarySugar`, and `dietaryCaffeine` with their default HealthKit units.
+
 ## 0.15.0
 
 * **Cycling power and cadence** (#44): authorize and sync `cyclingPower`, `cyclingCadence`, `cyclingSpeed`, and `cyclingFunctionalThresholdPower` (iOS 17+) as quantity samples — the same path as `heartRate` / `runningPower` — so Bluetooth power-meter timeseries and Apple Watch cycling workouts actually reach the backend. Workout-level averages for power, cadence and speed are populated from `HKWorkout` statistics.
