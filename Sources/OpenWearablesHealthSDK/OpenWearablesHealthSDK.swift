@@ -441,8 +441,11 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
     /// - Parameters:
     ///   - sinceMillis: Unix epoch in milliseconds; samples with a start date at or
     ///     after this are re-read up to now. The caller passes (lastSyncedAt - overlap).
+    ///   - types: Optional subset of ``HealthDataType`` to re-read. Intersected with
+    ///     currently tracked queryable types. `nil` (the default) re-reads every
+    ///     tracked type — the historical behaviour. An empty array matches nothing.
     ///   - completion: Called with `true` when the window upload was enqueued (or there was nothing to send).
-    public func syncRecentWindow(sinceMillis: Double, completion: @escaping (Bool) -> Void) {
+    public func syncRecentWindow(sinceMillis: Double, types: [HealthDataType]? = nil, completion: @escaping (Bool) -> Void) {
         guard userId != nil, hasAuth, let endpoint = syncEndpoint, let credential = authCredential else {
             logMessage("syncRecentWindow: not signed in")
             completion(false)
@@ -453,8 +456,15 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
             completion(false)
             return
         }
-        let types = getQueryableTypes()
-        guard !types.isEmpty else {
+        let queryable = getQueryableTypes()
+        let sampleTypes: [HKSampleType]
+        if let requested = types {
+            let requestedIds = Set(mapTypes(requested).map(\.identifier))
+            sampleTypes = queryable.filter { requestedIds.contains($0.identifier) }
+        } else {
+            sampleTypes = queryable
+        }
+        guard !sampleTypes.isEmpty else {
             logMessage("syncRecentWindow: no queryable types")
             completion(false)
             return
@@ -462,13 +472,13 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
 
         let start = Date(timeIntervalSince1970: max(sinceMillis, 0) / 1000.0)
         let predicate = HKQuery.predicateForSamples(withStart: start, end: nil, options: [])
-        logMessage("syncRecentWindow: re-reading \(types.count) types since \(start)")
+        logMessage("syncRecentWindow: re-reading \(sampleTypes.count) types since \(start)")
 
         let collectLock = NSLock()
         var collected: [HKSample] = []
         let group = DispatchGroup()
 
-        for type in types {
+        for type in sampleTypes {
             group.enter()
             let query = HKSampleQuery(
                 sampleType: type,
