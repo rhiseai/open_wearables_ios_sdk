@@ -670,7 +670,7 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
     ///     after this are re-read up to now. The caller passes (lastSyncedAt - overlap).
     ///   - types: Optional subset of ``HealthDataType`` to re-read. Intersected with
     ///     currently tracked queryable types. `nil` (the default) re-reads every
-    ///     tracked type — the historical behaviour.
+    ///     tracked type — the historical behaviour. An empty array matches nothing.
     ///   - completion: Called with `true` when the window upload was enqueued (or there was nothing to send).
     public func syncRecentWindow(sinceMillis: Double, types: [HealthDataType]? = nil, completion: @escaping (Bool) -> Void) {
         guard userId != nil, hasAuth, let endpoint = syncEndpoint, let credential = authCredential else {
@@ -685,7 +685,7 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         }
         let queryable = getQueryableTypes()
         let sampleTypes: [HKSampleType]
-        if let requested = types, !requested.isEmpty {
+        if let requested = types {
             let requestedIds = Set(mapTypes(requested).map(\.identifier))
             sampleTypes = queryable.filter { requestedIds.contains($0.identifier) }
         } else {
