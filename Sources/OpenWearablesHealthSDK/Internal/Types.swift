@@ -1,6 +1,23 @@
 import Foundation
 import HealthKit
 
+internal struct SerializedPayloadChunk {
+    let data: Data
+    let recordCount: Int
+    let isOversized: Bool
+}
+
+private enum PayloadCollection: Hashable {
+    case workouts
+    case records
+    case sleep
+}
+
+private struct EncodedPayloadEntry {
+    let collection: PayloadCollection
+    let data: Data
+}
+
 // MARK: - Public Health Data Type Enum
 
 /// Supported HealthKit data types for authorization and sync.
@@ -184,56 +201,146 @@ public enum HealthDataType: String, CaseIterable, Sendable {
 
 extension OpenWearablesHealthSDK {
 
-    // MARK: - Public API
-    internal func serialize(samples: [HKSample], type: HKSampleType) -> [String: Any] {
-        var workouts: [[String: Any]] = []
-        var records: [[String: Any]] = []
-        var sleep: [[String: Any]] = []
-        let df = ISO8601DateFormatter()
-
-        for s in samples {
-            if let w = s as? HKWorkout {
-                workouts.append(_mapWorkout(w))
-            } else if let q = s as? HKQuantitySample {
-                records.append(_mapQuantity(q))
-            } else if let c = s as? HKCategorySample {
-                if c.categoryType.identifier == HKCategoryTypeIdentifier.sleepAnalysis.rawValue {
-                    sleep.append(_mapSleep(c))
-                } else {
-                    records.append(_mapCategory(c))
-                }
-            } else if let corr = s as? HKCorrelation {
-                records.append(contentsOf: _mapCorrelation(corr))
-            } else {
-                records.append([
-                    "id": s.uuid.uuidString,
-                    "type": s.sampleType.identifier,
-                    "startDate": df.string(from: s.startDate),
-                    "endDate": df.string(from: s.endDate),
-                    "zoneOffset": _zoneOffsetString(metadata: s.metadata, date: s.startDate),
-                    "source": _mapSource(s.sourceRevision, device: s.device),
-                    "value": NSNull(),
-                    "unit": NSNull(),
-                    "parentId": NSNull(),
-                    "metadata": _metadataDict(s.metadata)
-                ])
-            }
-        }
+    // MARK: - Memory-efficient streaming serialization
+    internal func serializeCombinedStreaming(samples: [HKSample]) -> [String: Any] {
+        let collections = serializedCollections(samples: samples)
+        let dateFormatter = ISO8601DateFormatter()
 
         return [
             "provider": "apple",
             "sdkVersion": OpenWearablesHealthSDK.sdkVersion,
-            "syncTimestamp": df.string(from: Date()),
+            "syncTimestamp": dateFormatter.string(from: Date()),
             "data": [
-                "workouts": workouts,
-                "records": records,
-                "sleep": sleep
+                "workouts": collections.workouts,
+                "records": collections.records,
+                "sleep": collections.sleep
             ]
         ]
     }
-    
-    // MARK: - Memory-efficient streaming serialization
-    internal func serializeCombinedStreaming(samples: [HKSample]) -> [String: Any] {
+
+    /// Serializes HealthKit samples into independently uploadable JSON bodies.
+    /// Every body obeys both limits unless one serialized entry is larger than the
+    /// byte limit by itself; that entry is emitted alone so sync can still progress.
+    internal func serializeCombinedChunks(
+        samples: [HKSample],
+        maxBytes: Int,
+        maxRecords: Int
+    ) throws -> [SerializedPayloadChunk] {
+        let collections = serializedCollections(samples: samples)
+        return try makePayloadChunks(
+            workouts: collections.workouts,
+            records: collections.records,
+            sleep: collections.sleep,
+            syncTimestamp: ISO8601DateFormatter().string(from: Date()),
+            maxBytes: maxBytes,
+            maxRecords: maxRecords
+        )
+    }
+
+    /// Testable core for encoded-size chunking. Size accounting uses the exact
+    /// bytes returned to URLSession, not an estimate based on record count.
+    internal func makePayloadChunks(
+        workouts: [[String: Any]],
+        records: [[String: Any]],
+        sleep: [[String: Any]],
+        syncTimestamp: String,
+        maxBytes: Int,
+        maxRecords: Int
+    ) throws -> [SerializedPayloadChunk] {
+        precondition(maxBytes > 0, "maxBytes must be positive")
+        precondition(maxRecords > 0, "maxRecords must be positive")
+
+        let entries = try workouts.map { EncodedPayloadEntry(collection: .workouts, data: try encodePayloadEntry($0)) }
+            + records.map { EncodedPayloadEntry(collection: .records, data: try encodePayloadEntry($0)) }
+            + sleep.map { EncodedPayloadEntry(collection: .sleep, data: try encodePayloadEntry($0)) }
+
+        guard !entries.isEmpty else { return [] }
+
+        let emptyPayload = composePayloadData(
+            workouts: [], records: [], sleep: [], syncTimestamp: syncTimestamp
+        )
+        var chunks: [SerializedPayloadChunk] = []
+        var chunkEntries: [EncodedPayloadEntry] = []
+        var encodedBytes = emptyPayload.count
+        var collectionCounts: [PayloadCollection: Int] = [:]
+
+        func flush() {
+            guard !chunkEntries.isEmpty else { return }
+            let data = composePayloadData(
+                workouts: chunkEntries.filter { $0.collection == .workouts }.map(\.data),
+                records: chunkEntries.filter { $0.collection == .records }.map(\.data),
+                sleep: chunkEntries.filter { $0.collection == .sleep }.map(\.data),
+                syncTimestamp: syncTimestamp
+            )
+            chunks.append(SerializedPayloadChunk(
+                data: data,
+                recordCount: chunkEntries.count,
+                isOversized: data.count > maxBytes
+            ))
+            chunkEntries.removeAll(keepingCapacity: true)
+            collectionCounts.removeAll(keepingCapacity: true)
+            encodedBytes = emptyPayload.count
+        }
+
+        for entry in entries {
+            let separatorBytes = (collectionCounts[entry.collection] ?? 0) > 0 ? 1 : 0
+            let entryBytes = entry.data.count + separatorBytes
+            if !chunkEntries.isEmpty &&
+                (chunkEntries.count >= maxRecords || encodedBytes + entryBytes > maxBytes) {
+                flush()
+            }
+
+            chunkEntries.append(entry)
+            collectionCounts[entry.collection, default: 0] += 1
+            encodedBytes += entry.data.count + ((collectionCounts[entry.collection] ?? 0) > 1 ? 1 : 0)
+
+            if chunkEntries.count >= maxRecords || encodedBytes > maxBytes {
+                flush()
+            }
+        }
+        flush()
+
+        return chunks
+    }
+
+    private func encodePayloadEntry(_ object: [String: Any]) throws -> Data {
+        try JSONSerialization.data(withJSONObject: object, options: [])
+    }
+
+    private func composePayloadData(
+        workouts: [Data],
+        records: [Data],
+        sleep: [Data],
+        syncTimestamp: String
+    ) -> Data {
+        func jsonString(_ value: String) -> String {
+            guard let encoded = try? JSONSerialization.data(withJSONObject: [value]),
+                  let wrapped = String(data: encoded, encoding: .utf8) else {
+                return "\"\""
+            }
+            return String(wrapped.dropFirst().dropLast())
+        }
+
+        var data = Data("{\"provider\":\"apple\",\"sdkVersion\":\(jsonString(OpenWearablesHealthSDK.sdkVersion)),\"syncTimestamp\":\(jsonString(syncTimestamp)),\"data\":{\"workouts\":[".utf8)
+        appendJSONEntries(workouts, to: &data)
+        data.append(Data("],\"records\":[".utf8))
+        appendJSONEntries(records, to: &data)
+        data.append(Data("],\"sleep\":[".utf8))
+        appendJSONEntries(sleep, to: &data)
+        data.append(Data("]}}".utf8))
+        return data
+    }
+
+    private func appendJSONEntries(_ entries: [Data], to data: inout Data) {
+        for (index, entry) in entries.enumerated() {
+            if index > 0 { data.append(UInt8(ascii: ",")) }
+            data.append(entry)
+        }
+    }
+
+    private func serializedCollections(samples: [HKSample]) -> (
+        workouts: [[String: Any]], records: [[String: Any]], sleep: [[String: Any]]
+    ) {
         var workouts: [[String: Any]] = []
         var records: [[String: Any]] = []
         var sleep: [[String: Any]] = []
@@ -277,16 +384,7 @@ extension OpenWearablesHealthSDK {
             }
         }
         
-        return [
-            "provider": "apple",
-            "sdkVersion": OpenWearablesHealthSDK.sdkVersion,
-            "syncTimestamp": dateFormatter.string(from: Date()),
-            "data": [
-                "workouts": workouts,
-                "records": records,
-                "sleep": sleep
-            ]
-        ]
+        return (workouts, records, sleep)
     }
     
     // MARK: - Combined serialization (legacy)

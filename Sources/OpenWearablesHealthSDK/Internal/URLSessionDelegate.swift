@@ -10,81 +10,90 @@ extension OpenWearablesHealthSDK {
         let payloadPath = parts.count > 1 ? parts[1] : ""
         let anchorPath = parts.count > 2 ? parts[2] : ""
 
-        defer {
-            if !payloadPath.isEmpty { try? FileManager.default.removeItem(atPath: payloadPath) }
-            if error == nil, !itemPath.isEmpty { try? FileManager.default.removeItem(atPath: itemPath) }
+        if backgroundDataBuffer[task.taskIdentifier] != nil {
+            backgroundDataBuffer.removeValue(forKey: task.taskIdentifier)
         }
 
         if let error = error {
             let nsError = error as NSError
             if nsError.code != NSURLErrorCancelled {
-                NSLog("[OpenWearablesHealthSDK] background upload failed: \(error.localizedDescription)")
+                NSLog("[OpenWearablesHealthSDK] background upload failed: \(error.localizedDescription) - will retry later")
             }
             return
         }
 
-        if task.response is HTTPURLResponse {
-            if backgroundDataBuffer[task.taskIdentifier] != nil {
-                backgroundDataBuffer.removeValue(forKey: task.taskIdentifier)
+        let statusCode = (task.response as? HTTPURLResponse)?.statusCode ?? 0
+
+        if (200...299).contains(statusCode) {
+            if !itemPath.isEmpty,
+               let itemData = try? Data(contentsOf: URL(fileURLWithPath: itemPath)),
+               let item = try? JSONDecoder().decode(OutboxItem.self, from: itemData) {
+                // Saves anchors (combined & per-type), marks fullDone when applicable,
+                // and removes the item + anchor files.
+                handleSuccessfulUpload(
+                    itemPath: itemPath,
+                    anchorPath: anchorPath.isEmpty ? nil : anchorPath,
+                    wasFullExport: item.wasFullExport ?? false
+                )
             }
+            if !payloadPath.isEmpty { try? FileManager.default.removeItem(atPath: payloadPath) }
+            return
         }
-        
-        if let http = task.response as? HTTPURLResponse, !(200...299).contains(http.statusCode) {
-            if http.statusCode == 401 {
-                if isApiKeyAuth {
-                    self.logMessage("Background 401 with API key - emitting auth error")
-                    DispatchQueue.main.async { [weak self] in
-                        self?.emitAuthError(statusCode: 401)
-                    }
-                } else {
-                    self.attemptTokenRefresh { [weak self] result in
-                        guard let self = self else { return }
-                        switch result {
-                        case .success:
-                            self.logMessage("Token refreshed after background 401 - retrying outbox...")
+
+        if statusCode == 401 {
+            if isApiKeyAuth {
+                self.logMessage("Background 401 with API key - dropping item")
+                removeOutboxFiles(itemPath: itemPath, payloadPath: payloadPath, anchorPath: anchorPath)
+                recordPermanentSyncFailure(statusCode: 401)
+                DispatchQueue.main.async { [weak self] in
+                    self?.emitAuthError(statusCode: 401)
+                }
+            } else if outboxAuthenticationWasRetried(itemPath: itemPath) {
+                self.logMessage("Background 401 persisted after token refresh - dropping item")
+                removeOutboxFiles(itemPath: itemPath, payloadPath: payloadPath, anchorPath: anchorPath)
+                recordPermanentSyncFailure(statusCode: 401)
+                DispatchQueue.main.async { [weak self] in
+                    self?.emitAuthError(statusCode: 401)
+                }
+            } else {
+                self.attemptTokenRefresh { [weak self] result in
+                    guard let self = self else { return }
+                    switch result {
+                    case .success:
+                        if self.markOutboxAuthenticationRetried(itemPath: itemPath) {
+                            self.logMessage("Token refreshed after background 401 - retrying outbox once")
                             self.retryOutboxIfPossible()
-                        case .authFailure:
+                        } else {
+                            self.logMessage("Background 401 persisted after token refresh - dropping item")
+                            self.removeOutboxFiles(itemPath: itemPath, payloadPath: payloadPath, anchorPath: anchorPath)
+                            self.recordPermanentSyncFailure(statusCode: 401)
                             DispatchQueue.main.async { [weak self] in
                                 self?.emitAuthError(statusCode: 401)
                             }
-                        case .networkError:
-                            self.logMessage("Token refresh failed (network) after background 401 - will retry later")
                         }
+                    case .authFailure:
+                        self.removeOutboxFiles(itemPath: itemPath, payloadPath: payloadPath, anchorPath: anchorPath)
+                        self.recordPermanentSyncFailure(statusCode: 401)
+                        DispatchQueue.main.async { [weak self] in
+                            self?.emitAuthError(statusCode: 401)
+                        }
+                    case .networkError:
+                        self.logMessage("Token refresh failed (network) after background 401 - will retry later")
                     }
                 }
             }
             return
         }
 
-        if !itemPath.isEmpty,
-           let itemData = try? Data(contentsOf: URL(fileURLWithPath: itemPath)),
-           let item = try? JSONDecoder().decode(OutboxItem.self, from: itemData) {
-            
-            if item.typeIdentifier == "combined" {
-                if !anchorPath.isEmpty,
-                   let anchorData = try? Data(contentsOf: URL(fileURLWithPath: anchorPath)),
-                   let anchorsDict = try? NSKeyedUnarchiver.unarchivedObject(ofClasses: [NSDictionary.self, NSString.self, NSData.self], from: anchorData) as? [String: Data] {
-                    for (typeId, anchorData) in anchorsDict {
-                        saveAnchorData(anchorData, typeIdentifier: typeId, userKey: item.userKey)
-                    }
-                }
-                
-                if item.wasFullExport == true {
-                    let fullDoneKey = "fullDone.\(item.userKey)"
-                    let defaults = UserDefaults(suiteName: "com.openwearables.healthsdk.state") ?? .standard
-                    defaults.set(true, forKey: fullDoneKey)
-                    defaults.synchronize()
-                }
-            } else {
-                if !anchorPath.isEmpty,
-                   let anchorData = try? Data(contentsOf: URL(fileURLWithPath: anchorPath)) {
-                    saveAnchorData(anchorData, typeIdentifier: item.typeIdentifier, userKey: item.userKey)
-                }
-            }
-            if !anchorPath.isEmpty {
-                try? FileManager.default.removeItem(atPath: anchorPath)
-            }
+        if (400...499).contains(statusCode) {
+            NSLog("[OpenWearablesHealthSDK] background upload rejected (HTTP \(statusCode)) - dropping item")
+            removeOutboxFiles(itemPath: itemPath, payloadPath: payloadPath, anchorPath: anchorPath)
+            recordPermanentSyncFailure(statusCode: statusCode)
+            return
         }
+
+        // 5xx / no response: keep the files for a later retry pass.
+        NSLog("[OpenWearablesHealthSDK] background upload failed (HTTP \(statusCode)) - will retry later")
     }
 
     public func urlSessionDidFinishEvents(forBackgroundURLSession session: URLSession) {
@@ -93,14 +102,14 @@ extension OpenWearablesHealthSDK {
             handler()
         }
     }
-    
+
     public func urlSession(_ session: URLSession, task: URLSessionTask, didSendBodyData bytesSent: Int64, totalBytesSent: Int64, totalBytesExpectedToSend: Int64) {
         let progress = Double(totalBytesSent) / Double(totalBytesExpectedToSend) * 100
         if Int(progress) % 20 == 0 || progress > 99 {
             NSLog("[OpenWearablesHealthSDK] Upload progress: \(String(format: "%.1f", progress))%% (\(totalBytesSent)/\(totalBytesExpectedToSend) bytes)")
         }
     }
-    
+
     public func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive response: URLResponse, completionHandler: @escaping (URLSession.ResponseDisposition) -> Void) {
         completionHandler(.allow)
     }

@@ -69,8 +69,13 @@ extension OpenWearablesHealthSDK {
             logMessage("Incremental sync")
             syncAll(fullExport: false, completion: { completion(true) })
         } else {
+            if !tryStartInitialSync() {
+                logMessage("Initial export already in progress - skipping duplicate kickoff")
+                completion(false)
+                return
+            }
+
             logMessage("Full export")
-            isInitialSyncInProgress = true
             syncAll(fullExport: true, completion: { completion(true) })
         }
     }

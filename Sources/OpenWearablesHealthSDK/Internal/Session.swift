@@ -15,65 +15,69 @@ struct SyncState: Codable {
     let userKey: String
     let fullExport: Bool
     let createdAt: Date
-    
+
     var typeProgress: [String: TypeSyncProgress]
     var totalSentCount: Int
     var completedTypes: Set<String>
     var currentTypeIndex: Int
-    
+    var uploadedChunkCount: Int?
+    var uploadedRecordCount: Int?
+    var uploadedByteCount: Int?
+    var permanentFailureStatusCode: Int?
+
     var hasProgress: Bool {
         return totalSentCount > 0 || !completedTypes.isEmpty
     }
 }
 
 extension OpenWearablesHealthSDK {
-    
+
     // MARK: - Sync State File
-    
+
     internal func syncStateDir() -> URL {
         let base = try? FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true)
         return (base ?? FileManager.default.temporaryDirectory).appendingPathComponent("health_sync_state", isDirectory: true)
     }
-    
+
     internal func ensureSyncStateDir() {
         try? FileManager.default.createDirectory(at: syncStateDir(), withIntermediateDirectories: true)
     }
-    
+
     internal func syncStateFilePath() -> URL {
         return syncStateDir().appendingPathComponent("state.json")
     }
-    
+
     internal func anchorsFilePath() -> URL {
         return syncStateDir().appendingPathComponent("anchors.bin")
     }
-    
+
     // MARK: - Save/Load Sync State
-    
+
     internal func saveSyncState(_ state: SyncState) {
         ensureSyncStateDir()
         if let data = try? JSONEncoder().encode(state) {
             try? data.write(to: syncStateFilePath(), options: .atomic)
         }
     }
-    
+
     internal func loadSyncState() -> SyncState? {
         guard let data = try? Data(contentsOf: syncStateFilePath()),
               let state = try? JSONDecoder().decode(SyncState.self, from: data) else {
             return nil
         }
-        
+
         guard state.userKey == userKey() else {
             logMessage("Sync state for different user, clearing")
             clearSyncSession()
             return nil
         }
-        
+
         return state
     }
-    
+
     internal func updateTypeProgress(typeIdentifier: String, sentInChunk: Int, isComplete: Bool, anchorData: Data?, olderThan: Date? = nil) {
         guard var state = loadSyncState() else { return }
-        
+
         var progress = state.typeProgress[typeIdentifier] ?? TypeSyncProgress(
             typeIdentifier: typeIdentifier,
             sentCount: 0,
@@ -81,7 +85,7 @@ extension OpenWearablesHealthSDK {
             pendingAnchorData: nil,
             pendingOlderThan: nil
         )
-        
+
         progress.sentCount += sentInChunk
         progress.isComplete = isComplete
         if let anchorData = anchorData {
@@ -90,34 +94,49 @@ extension OpenWearablesHealthSDK {
         if let olderThan = olderThan {
             progress.pendingOlderThan = olderThan
         }
-        
+
         state.typeProgress[typeIdentifier] = progress
         state.totalSentCount += sentInChunk
-        
+
         if isComplete {
             state.completedTypes.insert(typeIdentifier)
             if let anchorData = progress.pendingAnchorData {
                 saveAnchorData(anchorData, typeIdentifier: typeIdentifier, userKey: state.userKey)
             }
         }
-        
+
         saveSyncState(state)
     }
-    
+
     internal func updateCurrentTypeIndex(_ index: Int) {
         guard var state = loadSyncState() else { return }
         state.currentTypeIndex = index
         saveSyncState(state)
     }
-    
+
+    internal func recordSuccessfulUploads(chunks: Int, records: Int, bytes: Int) {
+        guard var state = loadSyncState() else { return }
+        state.uploadedChunkCount = (state.uploadedChunkCount ?? 0) + chunks
+        state.uploadedRecordCount = (state.uploadedRecordCount ?? 0) + records
+        state.uploadedByteCount = (state.uploadedByteCount ?? 0) + bytes
+        saveSyncState(state)
+    }
+
+    internal func recordPermanentSyncFailure(statusCode: Int) {
+        guard var state = loadSyncState() else { return }
+        state.permanentFailureStatusCode = statusCode
+        saveSyncState(state)
+        logMessage("Sync paused after permanent HTTP \(statusCode); clear or reset the sync session before retrying")
+    }
+
     public func clearSyncSession() {
         try? FileManager.default.removeItem(at: syncStateFilePath())
         try? FileManager.default.removeItem(at: anchorsFilePath())
         logMessage("Cleared sync state")
     }
-    
+
     // MARK: - Start New Sync State
-    
+
     internal func startNewSyncState(fullExport: Bool, types: [HKSampleType]) -> SyncState {
         let state = SyncState(
             userKey: userKey(),
@@ -126,47 +145,51 @@ extension OpenWearablesHealthSDK {
             typeProgress: [:],
             totalSentCount: 0,
             completedTypes: [],
-            currentTypeIndex: 0
+            currentTypeIndex: 0,
+            uploadedChunkCount: 0,
+            uploadedRecordCount: 0,
+            uploadedByteCount: 0,
+            permanentFailureStatusCode: nil
         )
-        
+
         saveSyncState(state)
         return state
     }
-    
+
     // MARK: - Finalize Sync (mark complete)
-    
+
     internal func finalizeSyncState() {
         guard let state = loadSyncState() else { return }
-        
+
         if state.fullExport {
             let fullDoneKey = "fullDone.\(state.userKey)"
             defaults.set(true, forKey: fullDoneKey)
             defaults.synchronize()
             logMessage("Marked full export complete")
         }
-        
+
         logMessage("Sync complete: \(state.totalSentCount) samples across \(state.completedTypes.count) types")
-        
+
         clearSyncSession()
     }
-    
+
     // MARK: - Check for Resumable Session
-    
+
     internal func hasResumableSyncSession() -> Bool {
         guard let state = loadSyncState() else { return false }
         return state.hasProgress
     }
-    
+
     internal func shouldSyncType(_ typeIdentifier: String) -> Bool {
         guard let state = loadSyncState() else { return true }
         return !state.completedTypes.contains(typeIdentifier)
     }
-    
+
     internal func getResumeTypeIndex() -> Int {
         guard let state = loadSyncState() else { return 0 }
         return state.currentTypeIndex
     }
-    
+
     internal func getResumeCursors() -> (completedTypes: Set<String>, olderThanCursors: [String: Date], anchorDataCursors: [String: Data]) {
         guard let state = loadSyncState() else { return ([], [:], [:]) }
         var olderThanCursors: [String: Date] = [:]
@@ -183,16 +206,32 @@ extension OpenWearablesHealthSDK {
         }
         return (state.completedTypes, olderThanCursors, anchorDataCursors)
     }
-    
+
     // MARK: - Get Sync Status
-    
+
     internal func getSyncStatusDict() -> [String: Any] {
+        // Whether the initial full export (newest-first crawl of the whole history)
+        // has ever completed for this user. False = historical sync still pending
+        // or in progress; apps can use this to show a "keep the app open" hint.
+        let initialExportDone = defaults.bool(forKey: fullDoneKey())
+        let queued = pendingOutboxStats()
+
         if let state = loadSyncState() {
             return [
                 "hasResumableSession": state.hasProgress,
                 "sentCount": state.totalSentCount,
                 "completedTypes": state.completedTypes.count,
                 "isFullExport": state.fullExport,
+                "initialExportDone": initialExportDone,
+                "isSyncing": isSyncInProgress,
+                "uploadedChunks": state.uploadedChunkCount ?? 0,
+                "uploadedRecords": state.uploadedRecordCount ?? 0,
+                "uploadedBytes": state.uploadedByteCount ?? 0,
+                "queuedChunks": queued.chunks,
+                "queuedRecords": queued.records,
+                "queuedBytes": queued.bytes,
+                "hasPermanentFailure": state.permanentFailureStatusCode != nil,
+                "permanentFailureStatusCode": (state.permanentFailureStatusCode as Any?) ?? NSNull(),
                 "createdAt": ISO8601DateFormatter().string(from: state.createdAt)
             ]
         } else {
@@ -201,11 +240,21 @@ extension OpenWearablesHealthSDK {
                 "sentCount": 0,
                 "completedTypes": 0,
                 "isFullExport": false,
+                "initialExportDone": initialExportDone,
+                "isSyncing": isSyncInProgress,
+                "uploadedChunks": 0,
+                "uploadedRecords": 0,
+                "uploadedBytes": 0,
+                "queuedChunks": queued.chunks,
+                "queuedRecords": queued.records,
+                "queuedBytes": queued.bytes,
+                "hasPermanentFailure": false,
+                "permanentFailureStatusCode": NSNull(),
                 "createdAt": NSNull()
             ]
         }
     }
-    
+
     internal func loadSyncSession() -> SyncState? {
         return loadSyncState()
     }
