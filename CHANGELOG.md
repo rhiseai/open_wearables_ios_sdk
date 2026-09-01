@@ -4,6 +4,8 @@
 
 * **Bounded sync payloads by encoded size**: combined Apple Health payloads are split into independently persisted outbox items capped at 384 KiB and 2,000 serialized records (except a single oversized record, which is sent alone and diagnosed).
 * **Added chunk diagnostics**: sync status now reports sent and pending chunk/record/byte counts.
+* **Paused recent-window sync on terminal 4xx**: catch-up uploads now persist the permanent failure even when no resumable session existed, preventing repeated foreground submissions until the app explicitly clears or resets sync state.
+* **Aligned Rhise installation metadata**: CocoaPods and Swift Package Manager examples now resolve the Rhise fork rather than an upstream repository.
 
 ## 0.14.0
 

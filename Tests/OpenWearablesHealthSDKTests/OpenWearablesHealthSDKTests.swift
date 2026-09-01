@@ -91,10 +91,11 @@ final class OpenWearablesHealthSDKTests: XCTestCase {
         XCTAssertEqual(sdk.classifyUploadResponse(statusCode: 422), .permanentlyRejected)
         XCTAssertEqual(sdk.classifyUploadResponse(statusCode: 503), .retryableFailure)
 
-        _ = sdk.startNewSyncState(fullExport: true, types: [])
+        XCTAssertNil(sdk.loadSyncState())
         sdk.recordPermanentSyncFailure(statusCode: 422)
 
         let state = sdk.loadSyncState()
+        XCTAssertEqual(state?.fullExport, false)
         XCTAssertEqual(state?.totalSentCount, 0)
         XCTAssertEqual(state?.uploadedChunkCount, 0)
         XCTAssertEqual(state?.uploadedRecordCount, 0)

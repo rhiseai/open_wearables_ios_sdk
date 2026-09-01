@@ -123,7 +123,19 @@ extension OpenWearablesHealthSDK {
     }
 
     internal func recordPermanentSyncFailure(statusCode: Int) {
-        guard var state = loadSyncState() else { return }
+        var state = loadSyncState() ?? SyncState(
+            userKey: userKey(),
+            fullExport: false,
+            createdAt: Date(),
+            typeProgress: [:],
+            totalSentCount: 0,
+            completedTypes: [],
+            currentTypeIndex: 0,
+            uploadedChunkCount: 0,
+            uploadedRecordCount: 0,
+            uploadedByteCount: 0,
+            permanentFailureStatusCode: nil
+        )
         state.permanentFailureStatusCode = statusCode
         saveSyncState(state)
         logMessage("Sync paused after permanent HTTP \(statusCode); clear or reset the sync session before retrying")
