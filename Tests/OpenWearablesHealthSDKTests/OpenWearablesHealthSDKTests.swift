@@ -116,4 +116,53 @@ final class OpenWearablesHealthSDKTests: XCTestCase {
         XCTAssertFalse(sdk.tryStartInitialSync())
         XCTAssertTrue(sdk.isInitialSyncActive)
     }
+
+    func testIncrementalTriggerEscalatesUntilInitialExportCompletes() {
+        let sdk = OpenWearablesHealthSDK.shared
+
+        XCTAssertTrue(
+            sdk.resolveFullExport(
+                requestedFullExport: false,
+                existingState: nil,
+                initialExportDone: false
+            )
+        )
+    }
+
+    func testIncrementalTriggerCannotDowngradeFullExportSession() {
+        let sdk = OpenWearablesHealthSDK.shared
+        let fullExportState = SyncState(
+            userKey: "test-user",
+            fullExport: true,
+            createdAt: Date(),
+            typeProgress: [:],
+            totalSentCount: 0,
+            completedTypes: [],
+            currentTypeIndex: 0,
+            uploadedChunkCount: 0,
+            uploadedRecordCount: 0,
+            uploadedByteCount: 0,
+            permanentFailureStatusCode: nil
+        )
+
+        XCTAssertTrue(
+            sdk.resolveFullExport(
+                requestedFullExport: false,
+                existingState: fullExportState,
+                initialExportDone: true
+            )
+        )
+    }
+
+    func testIncrementalTriggerStaysIncrementalAfterInitialExport() {
+        let sdk = OpenWearablesHealthSDK.shared
+
+        XCTAssertFalse(
+            sdk.resolveFullExport(
+                requestedFullExport: false,
+                existingState: nil,
+                initialExportDone: true
+            )
+        )
+    }
 }
