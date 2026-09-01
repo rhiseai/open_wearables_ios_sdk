@@ -14,8 +14,8 @@ Native iOS SDK for secure background health data synchronization from Apple Heal
 
 ## Requirements
 
-- iOS 14.0+
-- Swift 5.0+
+- iOS 15.0+
+- Swift 5.9+
 - HealthKit entitlement
 
 ## Installation
@@ -26,7 +26,7 @@ Add to your `Package.swift`:
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/the-momentum/OpenWearablesHealthSDK.git", from: "0.1.0")
+    .package(url: "https://github.com/rhiseai/open_wearables_ios_sdk.git", branch: "master")
 ]
 ```
 
@@ -35,7 +35,9 @@ Or in Xcode: File > Add Package Dependencies > paste the repository URL.
 ### CocoaPods
 
 ```ruby
-pod 'OpenWearablesHealthSDK', '~> 0.1.0'
+pod 'OpenWearablesHealthSDK',
+    :git => 'https://github.com/rhiseai/open_wearables_ios_sdk.git',
+    :branch => 'master'
 ```
 
 ## Usage

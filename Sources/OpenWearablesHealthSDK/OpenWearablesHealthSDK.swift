@@ -552,6 +552,20 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
                 self.uploadPayloadChunks(
                     chunks, endpoint: endpoint, credential: credential
                 ) { result in
+                    if let statusCode = result.permanentFailureStatusCode {
+                        // Recent-window catch-up normally runs without a resumable
+                        // sync state. Persist the terminal failure before recording
+                        // any preceding successful chunks so automatic foreground
+                        // catch-up cannot repeatedly submit a rejected payload.
+                        self.recordPermanentSyncFailure(statusCode: statusCode)
+                    }
+                    if result.uploadedChunks > 0 {
+                        self.recordSuccessfulUploads(
+                            chunks: result.uploadedChunks,
+                            records: result.uploadedRecords,
+                            bytes: result.uploadedBytes
+                        )
+                    }
                     self.logMessage(
                         "syncRecentWindow: processed \(collected.count) samples in \(chunks.count) chunk(s) (ok=\(result.completed))"
                     )
