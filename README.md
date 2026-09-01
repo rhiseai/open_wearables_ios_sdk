@@ -84,6 +84,10 @@ sdk.requestAuthorization(types: [.steps, .heartRate, .sleep]) { granted in
     }
 }
 
+// Trigger a fresh anchor-based incremental sync, for example on foreground.
+// An unfinished initial export remains a full export and is resumed safely.
+sdk.syncNow { }
+
 // Stop sync
 sdk.stopBackgroundSync()
 

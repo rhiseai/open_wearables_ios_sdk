@@ -3,6 +3,7 @@
 ## Unreleased
 
 * **Rhise fork health types**: authorize and sync `basalBodyTemperature`, `dietaryFiber`, `dietarySugar`, and `dietaryCaffeine` with their default HealthKit units.
+* **Rhise foreground sync API**: `syncNow(completion:)` starts a fresh anchor-based round after the initial export while preserving an unfinished full export.
 
 ## 0.15.0
 

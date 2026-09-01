@@ -616,7 +616,16 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         cancelAllBGTasks()
         OpenWearablesHealthSdkKeychain.setSyncActive(false)
     }
-    
+    /// Trigger an immediate anchor-based sync.
+    ///
+    /// This starts a fresh incremental round after the initial export has
+    /// completed. If the initial export is still pending, the sync state machine
+    /// keeps that export in full-export mode and resumes it instead. Concurrent
+    /// calls are coalesced by the existing single-flight sync guard.
+    public func syncNow(completion: @escaping () -> Void) {
+        syncAll(fullExport: false, completion: completion)
+    }
+
     /// Whether sync is currently active.
     public var isSyncActive: Bool {
         return OpenWearablesHealthSdkKeychain.isSyncActive()
@@ -988,7 +997,23 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
             startRoundRobin()
         }
     }
-    
+    /// Resolve the requested mode without ever replacing an unfinished full
+    /// export with an incremental session. Kept separate so the regression can
+    /// be verified without requiring a live HealthKit store.
+    internal func resolveFullExport(
+        requestedFullExport: Bool,
+        existingState: SyncState?,
+        initialExportDone: Bool
+    ) -> Bool {
+        if existingState?.fullExport == true {
+            return true
+        }
+        if !initialExportDone {
+            return true
+        }
+        return requestedFullExport
+    }
+
     // MARK: - Round-Robin Sync Orchestration
     
     private class RoundRobinState {
