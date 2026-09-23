@@ -1,6 +1,6 @@
 Pod::Spec.new do |s|
   s.name         = 'OpenWearablesHealthSDK'
-  s.version      = '0.14.0'
+  s.version      = '0.15.0'
   s.summary      = 'iOS SDK for background health data synchronization to the Open Wearables platform.'
   s.description  = <<-DESC
     Native iOS SDK for secure background health data synchronization from Apple HealthKit
@@ -10,9 +10,9 @@ Pod::Spec.new do |s|
   s.homepage     = 'https://github.com/rhiseai/open_wearables_ios_sdk'
   s.license      = { :type => 'MIT', :file => 'LICENSE' }
   s.author       = { 'Open Wearables' => 'hello@openwearables.io' }
-  s.source       = { :git => 'https://github.com/rhiseai/open_wearables_ios_sdk.git', :branch => 'master' }
+  s.source       = { :git => 'https://github.com/rhiseai/open_wearables_ios_sdk.git', :tag => s.version.to_s }
   s.platform     = :ios, '15.0'
-  s.swift_version = '5.9'
+  s.swift_version = '5.0'
   s.source_files = 'Sources/OpenWearablesHealthSDK/**/*.swift'
   s.frameworks   = 'HealthKit', 'BackgroundTasks', 'UIKit'
 end

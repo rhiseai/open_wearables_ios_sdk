@@ -3,349 +3,215 @@ import HealthKit
 
 extension OpenWearablesHealthSDK {
 
-    internal enum UploadDisposition: Equatable {
-        case delivered
-        case permanentlyRejected(statusCode: Int)
-        case retryableFailure
-    }
-
-    internal enum HTTPUploadResponseDisposition: Equatable {
-        case delivered
-        case refreshAuthentication
-        case permanentlyRejected
-        case retryableFailure
-    }
-
-    internal func classifyUploadResponse(statusCode: Int) -> HTTPUploadResponseDisposition {
-        if (200...299).contains(statusCode) { return .delivered }
-        if statusCode == 401 { return .refreshAuthentication }
-        if (400...499).contains(statusCode) { return .permanentlyRejected }
-        return .retryableFailure
-    }
-
     // MARK: - Outbox model
+
+    /// Decoded, never encoded: the sync path stopped writing outbox items in 0.14, so
+    /// the only items on disk are leftovers from an earlier SDK version.
     internal struct OutboxItem: Codable {
         let typeIdentifier: String
         let userKey: String
         let payloadPath: String
         let anchorPath: String?
         let wasFullExport: Bool?
-        let recordCount: Int?
-        let byteCount: Int?
-        var authRetryCount: Int?
     }
 
+    /// Read-only. Nothing creates this directory anymore; when it is missing the
+    /// enumerations in `clearOutbox` and `retryOutboxIfPossible` simply find nothing.
     internal func outboxDir() -> URL {
-        let base = try? FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true)
-        return (base ?? FileManager.default.temporaryDirectory).appendingPathComponent("health_outbox", isDirectory: true)
-    }
-
-    internal func ensureOutboxDir() {
-        try? FileManager.default.createDirectory(at: outboxDir(), withIntermediateDirectories: true)
-    }
-
-    internal func newPath(_ name: String, ext: String) -> URL {
-        ensureOutboxDir()
-        return outboxDir().appendingPathComponent("\(name).\(ext)")
+        return stateBaseDirectory().appendingPathComponent("health_outbox", isDirectory: true)
     }
 
     // MARK: - Combined upload
-    internal func enqueueCombinedUpload(
+    
+    /// Uploads one combined sync round.
+    ///
+    /// Nothing is written to the outbox. Progress lives in `SyncState` and advances
+    /// only on a 2xx, so an interrupted round is rebuilt from HealthKit by the next
+    /// sync. A persisted copy could only ever be replayed as a duplicate of data that
+    /// the next sync re-fetches anyway, while `SyncState` knew nothing about it.
+    /// Whether a combined-upload HTTP status should advance SyncState.
+    /// Only 2xx means the server accepted the body. 4xx (including the production
+    /// `ClientDisconnect` 400) must not move cursors — the chunk is rebuilt later.
+    internal static func syncShouldAdvance(afterHTTPStatus statusCode: Int) -> Bool {
+        (200...299).contains(statusCode)
+    }
+
+    /// Retrying a stable client rejection with the same payload on every wake wastes
+    /// battery. Authentication, request timeout and throttling retain their dedicated
+    /// recovery paths and therefore do not pause the sync session.
+    internal static func syncShouldPause(afterHTTPStatus statusCode: Int) -> Bool {
+        (400...499).contains(statusCode) && ![401, 403, 408, 429].contains(statusCode)
+    }
+    
+    internal func uploadCombinedPayload(
         payload: [String: Any],
-        anchors: [String: HKQueryAnchor],
         endpoint: URL,
         credential: String,
-        wasFullExport: Bool = false,
+        generation: Int,
         completion: @escaping (Bool) -> Void
     ) {
-        guard let data = try? JSONSerialization.data(withJSONObject: payload) else {
+        guard let payloadData = try? JSONSerialization.data(withJSONObject: payload) else {
             self.logMessage("Failed to serialize payload")
             completion(false)
             return
         }
-
-        let recordCount: Int = {
-            guard let payloadData = payload["data"] as? [String: Any] else { return 0 }
-            return (payloadData["workouts"] as? [[String: Any]] ?? []).count
-                + (payloadData["records"] as? [[String: Any]] ?? []).count
-                + (payloadData["sleep"] as? [[String: Any]] ?? []).count
-        }()
-
-        enqueueCombinedUpload(
-            payloadData: data,
-            recordCount: recordCount,
-            anchors: anchors,
-            endpoint: endpoint,
-            credential: credential,
-            wasFullExport: wasFullExport
-        ) { disposition in
-            switch disposition {
-            case .delivered:
-                completion(true)
-            case .permanentlyRejected, .retryableFailure:
-                completion(false)
-            }
-        }
-    }
-
-    internal func enqueueCombinedUpload(
-        payloadData: Data,
-        recordCount: Int,
-        anchors: [String: HKQueryAnchor],
-        endpoint: URL,
-        credential: String,
-        wasFullExport: Bool = false,
-        completion: @escaping (UploadDisposition) -> Void
-    ) {
-
-        let id = UUID().uuidString
-        let payloadURL = newPath("combined_payload_\(id)", ext: "json")
-
-        do {
-            try payloadData.write(to: payloadURL, options: Data.WritingOptions.atomic)
-        } catch {
-            self.logMessage("Failed to write payload: \(error.localizedDescription)")
-            completion(.retryableFailure)
-            return
-        }
-
-        var anchorsURL: URL? = nil
-        if !anchors.isEmpty {
-            var anchorsData: [String: Data] = [:]
-            for (typeId, anchor) in anchors {
-                if let data = try? NSKeyedArchiver.archivedData(withRootObject: anchor, requiringSecureCoding: true) {
-                    anchorsData[typeId] = data
-                }
-            }
-
-            if let serializedData = try? NSKeyedArchiver.archivedData(withRootObject: anchorsData, requiringSecureCoding: true) {
-                let u = newPath("combined_anchors_\(id)", ext: "bin")
-                try? serializedData.write(to: u, options: Data.WritingOptions.atomic)
-                anchorsURL = u
-            }
-        }
-
-        let item = OutboxItem(
-            typeIdentifier: "combined",
-            userKey: userKey(),
-            payloadPath: payloadURL.path,
-            anchorPath: anchorsURL?.path,
-            wasFullExport: wasFullExport,
-            recordCount: recordCount,
-            byteCount: payloadData.count,
-            authRetryCount: 0
-        )
-        let itemURL = newPath("combined_item_\(id)", ext: "json")
-        do {
-            let metadata = try JSONEncoder().encode(item)
-            try metadata.write(to: itemURL, options: Data.WritingOptions.atomic)
-        } catch {
-            self.logMessage("Failed to persist outbox metadata: \(error.localizedDescription)")
-            try? FileManager.default.removeItem(at: payloadURL)
-            if let anchorsURL = anchorsURL { try? FileManager.default.removeItem(at: anchorsURL) }
-            completion(.retryableFailure)
-            return
-        }
-
-        var req = URLRequest(url: endpoint)
-        req.httpMethod = "POST"
-        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        applyAuth(to: &req, credential: credential)
+        
+        let requestId = UUID().uuidString
+        var req = buildRequest(url: endpoint, credential: credential, requestId: requestId)
         req.httpBody = payloadData
-        req.setValue("\(payloadData.count)", forHTTPHeaderField: "Content-Length")
-
+        
         self.logPayloadSummary(payloadData, label: "Sending")
-
+        
         let task = foregroundSession.dataTask(with: req) { [weak self] data, response, error in
             guard let self = self else { return }
-
-            if let error = error {
-                let nsError = error as NSError
-                if nsError.code != NSURLErrorCancelled {
-                    self.logMessage("Upload error: \(error.localizedDescription)")
-                    self.markNetworkError()
-                }
-                completion(.retryableFailure)
+            
+            let completedTask = self.untrackSyncUpload(requestId: requestId)
+            let statusCode = (response as? HTTPURLResponse)?.statusCode
+            self.logUploadOutcome(
+                stage: "sync", requestId: requestId, declaredBytes: payloadData.count,
+                task: completedTask, statusCode: statusCode, error: error
+            )
+            
+            if self.isSyncCancelled(generation: generation) {
+                completion(false)
+                return
+            }
+            
+            if error != nil {
+                self.markNetworkError()
+                completion(false)
+                return
+            }
+            
+            guard let statusCode = statusCode else {
+                self.logMessage("No HTTP response")
+                self.markNetworkError()
+                completion(false)
+                return
+            }
+            
+            if OpenWearablesHealthSDK.syncShouldAdvance(afterHTTPStatus: statusCode) {
+                completion(true)
+                return
+            }
+            
+            if statusCode == 401 {
+                self.handle401ForUpload(
+                    payloadData: payloadData,
+                    endpoint: endpoint,
+                    requestId: requestId,
+                    generation: generation,
+                    completion: completion
+                )
                 return
             }
 
-            if let httpResponse = response as? HTTPURLResponse {
-                switch self.classifyUploadResponse(statusCode: httpResponse.statusCode) {
-                case .delivered:
-                    self.logMessage("HTTP \(httpResponse.statusCode)")
-
-                    self.handleSuccessfulUpload(itemPath: itemURL.path, anchorPath: anchorsURL?.path, wasFullExport: wasFullExport)
-
-                    try? FileManager.default.removeItem(atPath: payloadURL.path)
-                    completion(.delivered)
-                case .refreshAuthentication:
-                    self.handle401ForUpload(
-                        payloadData: payloadData,
-                        endpoint: endpoint,
-                        itemPath: itemURL.path,
-                        payloadPath: payloadURL.path,
-                        anchorsPath: anchorsURL?.path,
-                        wasFullExport: wasFullExport,
-                        completion: completion
-                    )
-                case .permanentlyRejected:
-                    var errorMsg = "HTTP \(httpResponse.statusCode)"
-                    if let data = data, let errorBody = String(data: data, encoding: .utf8) {
-                        let truncated = errorBody.count > 200 ? String(errorBody.prefix(200)) + "..." : errorBody
-                        errorMsg += " - \(truncated)"
-                    }
-                    self.logMessage(errorMsg)
-                    self.logMessage("Dropping chunk rejected with HTTP \(httpResponse.statusCode)")
-                    self.removeOutboxFiles(itemPath: itemURL.path, payloadPath: payloadURL.path, anchorPath: anchorsURL?.path)
-                    completion(.permanentlyRejected(statusCode: httpResponse.statusCode))
-                case .retryableFailure:
-                    self.logMessage("HTTP \(httpResponse.statusCode) - will retry later")
-                    completion(.retryableFailure)
-                }
-            } else {
-                self.logMessage("No HTTP response")
-                self.markNetworkError()
-                completion(.retryableFailure)
+            if OpenWearablesHealthSDK.syncShouldPause(afterHTTPStatus: statusCode) {
+                self.recordPermanentSyncFailure(statusCode: statusCode)
             }
+            
+            if let data = data, let errorBody = String(data: data, encoding: .utf8), !errorBody.isEmpty {
+                let truncated = errorBody.count > 200 ? String(errorBody.prefix(200)) + "..." : errorBody
+                self.logDiagnostic("HTTP \(statusCode) - \(truncated)")
+            }
+            
+            completion(false)
         }
-
+        
+        trackSyncUpload(task, requestId: requestId)
         task.resume()
     }
-
-    /// Handles 401 response for combined uploads.
+    
+    /// Handles 401 response for combined uploads. The retry reuses `requestId` so both
+    /// attempts are one story in the server-side logs.
     private func handle401ForUpload(
         payloadData: Data,
         endpoint: URL,
-        itemPath: String,
-        payloadPath: String,
-        anchorsPath: String?,
-        wasFullExport: Bool,
-        completion: @escaping (UploadDisposition) -> Void
+        requestId: String,
+        generation: Int,
+        completion: @escaping (Bool) -> Void
     ) {
         if isApiKeyAuth {
             self.logMessage("Got 401 with apiKey auth")
             self.emitAuthError(statusCode: 401)
-            removeOutboxFiles(itemPath: itemPath, payloadPath: payloadPath, anchorPath: anchorsPath)
-            completion(.permanentlyRejected(statusCode: 401))
+            completion(false)
             return
         }
-
+        
         self.logMessage("Got 401, refreshing token...")
-
+        
         self.attemptTokenRefresh { [weak self] result in
             guard let self = self else { return }
-
+            
+            if self.isSyncCancelled(generation: generation) {
+                completion(false)
+                return
+            }
+            
             switch result {
             case .success:
                 guard let newCredential = self.authCredential else {
                     self.logMessage("Token refreshed but no credential available")
-                    completion(.retryableFailure)
+                    completion(false)
                     return
                 }
                 self.logMessage("Token refreshed, retrying...")
-
-                var retryReq = URLRequest(url: endpoint)
-                retryReq.httpMethod = "POST"
-                retryReq.setValue("application/json", forHTTPHeaderField: "Content-Type")
-                self.applyAuth(to: &retryReq, credential: newCredential)
+                
+                let retryKey = "\(requestId)#retry"
+                var retryReq = self.buildRequest(url: endpoint, credential: newCredential, requestId: requestId)
                 retryReq.httpBody = payloadData
-                retryReq.setValue("\(payloadData.count)", forHTTPHeaderField: "Content-Length")
-
-                let retryTask = self.foregroundSession.dataTask(with: retryReq) { [weak self] retryData, retryResponse, retryError in
+                
+                let retryTask = self.foregroundSession.dataTask(with: retryReq) { [weak self] _, retryResponse, retryError in
                     guard let self = self else { return }
-
-                    if let retryError = retryError {
-                        self.logMessage("Retry failed: \(retryError.localizedDescription)")
-                        completion(.retryableFailure)
+                    
+                    let completedTask = self.untrackSyncUpload(requestId: retryKey)
+                    let retryStatus = (retryResponse as? HTTPURLResponse)?.statusCode
+                    self.logUploadOutcome(
+                        stage: "sync-401-retry", requestId: requestId, declaredBytes: payloadData.count,
+                        task: completedTask, statusCode: retryStatus, error: retryError
+                    )
+                    
+                    if self.isSyncCancelled(generation: generation) {
+                        completion(false)
                         return
                     }
-
-                    let retryStatus = (retryResponse as? HTTPURLResponse)?.statusCode ?? 0
-                    switch self.classifyUploadResponse(statusCode: retryStatus) {
-                    case .delivered:
-                        self.logMessage("Retry: HTTP \(retryStatus)")
-                        self.handleSuccessfulUpload(itemPath: itemPath, anchorPath: anchorsPath, wasFullExport: wasFullExport)
-                        try? FileManager.default.removeItem(atPath: payloadPath)
-                        completion(.delivered)
-                    case .refreshAuthentication, .permanentlyRejected:
-                        self.logMessage("Retry permanently rejected: HTTP \(retryStatus)")
-                        if (401...403).contains(retryStatus) { self.emitAuthError(statusCode: retryStatus) }
-                        self.removeOutboxFiles(itemPath: itemPath, payloadPath: payloadPath, anchorPath: anchorsPath)
-                        completion(.permanentlyRejected(statusCode: retryStatus))
-                    case .retryableFailure:
-                        self.logMessage("Retry failed: HTTP \(retryStatus) - will retry later")
-                        completion(.retryableFailure)
+                    
+                    if retryError != nil {
+                        self.markNetworkError()
+                        completion(false)
+                        return
                     }
+                    
+                    if let retryStatus = retryStatus, OpenWearablesHealthSDK.syncShouldAdvance(afterHTTPStatus: retryStatus) {
+                        completion(true)
+                        return
+                    }
+                    
+                    if let retryStatus = retryStatus, (401...403).contains(retryStatus) {
+                        self.emitAuthError(statusCode: retryStatus)
+                    } else if let retryStatus = retryStatus,
+                              OpenWearablesHealthSDK.syncShouldPause(afterHTTPStatus: retryStatus) {
+                        self.recordPermanentSyncFailure(statusCode: retryStatus)
+                    }
+                    completion(false)
                 }
+                
+                self.trackSyncUpload(retryTask, requestId: retryKey)
                 retryTask.resume()
-
+                
             case .authFailure:
                 self.logMessage("Token refresh rejected - auth is invalid")
                 self.emitAuthError(statusCode: 401)
-                removeOutboxFiles(itemPath: itemPath, payloadPath: payloadPath, anchorPath: anchorsPath)
-                completion(.permanentlyRejected(statusCode: 401))
-
+                completion(false)
+                
             case .networkError:
                 self.logMessage("Token refresh failed (network) - will retry later")
                 self.markNetworkError()
-                completion(.retryableFailure)
+                completion(false)
             }
         }
     }
-
-    internal func removeOutboxFiles(itemPath: String, payloadPath: String, anchorPath: String?) {
-        try? FileManager.default.removeItem(atPath: itemPath)
-        try? FileManager.default.removeItem(atPath: payloadPath)
-        if let anchorPath = anchorPath, !anchorPath.isEmpty {
-            try? FileManager.default.removeItem(atPath: anchorPath)
-        }
-    }
-
-    /// Records the single authentication refresh allowed for a persisted item.
-    /// Returns false when that item has already been retried with fresh credentials.
-    internal func markOutboxAuthenticationRetried(itemPath: String) -> Bool {
-        let url = URL(fileURLWithPath: itemPath)
-        guard let data = try? Data(contentsOf: url),
-              var item = try? JSONDecoder().decode(OutboxItem.self, from: data),
-              (item.authRetryCount ?? 0) == 0 else { return false }
-        item.authRetryCount = 1
-        guard let updated = try? JSONEncoder().encode(item) else { return false }
-        do {
-            try updated.write(to: url, options: .atomic)
-            return true
-        } catch {
-            return false
-        }
-    }
-
-    internal func outboxAuthenticationWasRetried(itemPath: String) -> Bool {
-        let url = URL(fileURLWithPath: itemPath)
-        guard let data = try? Data(contentsOf: url),
-              let item = try? JSONDecoder().decode(OutboxItem.self, from: data) else { return false }
-        return (item.authRetryCount ?? 0) > 0
-    }
-
-    internal func pendingOutboxStats() -> (chunks: Int, records: Int, bytes: Int) {
-        guard let files = try? FileManager.default.contentsOfDirectory(
-            at: outboxDir(), includingPropertiesForKeys: nil
-        ) else { return (0, 0, 0) }
-
-        var chunks = 0
-        var records = 0
-        var bytes = 0
-        for itemURL in files where
-            itemURL.lastPathComponent.hasPrefix("combined_item_") ||
-            itemURL.lastPathComponent.hasPrefix("item_") {
-            guard let data = try? Data(contentsOf: itemURL),
-                  let item = try? JSONDecoder().decode(OutboxItem.self, from: data),
-                  FileManager.default.fileExists(atPath: item.payloadPath) else { continue }
-            chunks += 1
-            records += item.recordCount ?? 0
-            bytes += item.byteCount ?? ((try? Data(contentsOf: URL(fileURLWithPath: item.payloadPath)).count) ?? 0)
-        }
-        return (chunks, records, bytes)
-    }
-
+    
     // MARK: - Handle successful upload
     internal func handleSuccessfulUpload(itemPath: String, anchorPath: String?, wasFullExport: Bool) {
         guard let itemData = try? Data(contentsOf: URL(fileURLWithPath: itemPath)),
@@ -353,7 +219,18 @@ extension OpenWearablesHealthSDK {
             logMessage("Failed to read item for anchor saving")
             return
         }
-
+        
+        // signOut() clears credentials and the outbox asynchronously relative to
+        // background-session callbacks. Do not persist anchors or fullDone for a
+        // user who is gone, or for an item that belongs to a previous session.
+        guard OpenWearablesHealthSdkKeychain.hasSession(), item.userKey == userKey() else {
+            if let anchorPath = anchorPath, !anchorPath.isEmpty {
+                try? FileManager.default.removeItem(atPath: anchorPath)
+            }
+            try? FileManager.default.removeItem(atPath: itemPath)
+            return
+        }
+        
         if let anchorPath = anchorPath, !anchorPath.isEmpty {
             if item.typeIdentifier == "combined" {
                 if let anchorData = try? Data(contentsOf: URL(fileURLWithPath: anchorPath)),
@@ -368,17 +245,17 @@ extension OpenWearablesHealthSDK {
                     saveAnchorData(anchorData, typeIdentifier: item.typeIdentifier, userKey: item.userKey)
                 }
             }
-
+            
             try? FileManager.default.removeItem(atPath: anchorPath)
         }
-
+        
         if wasFullExport {
             let fullDoneKey = "fullDone.\(item.userKey)"
             defaults.set(true, forKey: fullDoneKey)
             defaults.synchronize()
             logMessage("Marked full export complete")
         }
-
+        
         try? FileManager.default.removeItem(atPath: itemPath)
     }
 
@@ -394,15 +271,18 @@ extension OpenWearablesHealthSDK {
     }
 
     // MARK: - Retry pending items
-
+    
     /// Minimum file age before an outbox item is retried (the original upload may
     /// still be in flight).
     private static let outboxMinRetryAge: TimeInterval = 30
     /// Items older than this are dropped - the data is re-fetched from HealthKit by
     /// the regular sync anyway, so there is no point in re-sending week-old batches.
     private static let outboxMaxItemAge: TimeInterval = 7 * 24 * 3600
-
+    
     /// Retries pending outbox items through the *background* URLSession.
+    ///
+    /// The sync path no longer enqueues items. This only drains leftovers from
+    /// earlier SDK versions and then expires them.
     /// - uploads go through the background session (survive suspension/kill),
     /// - the session is limited to one connection per host, so items go out serially,
     /// - a retry pass is skipped while a regular sync is running,
@@ -410,12 +290,12 @@ extension OpenWearablesHealthSDK {
     /// - items already enqueued in the background session are not enqueued again.
     internal func retryOutboxIfPossible() {
         guard let endpoint = self.syncEndpoint, let credential = self.authCredential else { return }
-
+        
         if isSyncInProgress {
             logMessage("Outbox retry skipped - sync in progress")
             return
         }
-
+        
         outboxRetryLock.lock()
         if isRetryingOutbox {
             outboxRetryLock.unlock()
@@ -423,7 +303,7 @@ extension OpenWearablesHealthSDK {
         }
         isRetryingOutbox = true
         outboxRetryLock.unlock()
-
+        
         session.getAllTasks { [weak self] tasks in
             guard let self = self else { return }
             defer {
@@ -431,7 +311,7 @@ extension OpenWearablesHealthSDK {
                 self.isRetryingOutbox = false
                 self.outboxRetryLock.unlock()
             }
-
+            
             // Payloads already queued in the background session (possibly from a
             // previous app run) must not be enqueued a second time.
             let inFlightPayloadPaths = Set(tasks.compactMap { task -> String? in
@@ -439,35 +319,35 @@ extension OpenWearablesHealthSDK {
                 guard let parts = parts, parts.count > 1 else { return nil }
                 return String(parts[1])
             })
-
+            
             let dir = self.outboxDir()
             guard let files = try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil) else { return }
-
+            
             let itemFiles = files.filter {
                 $0.pathExtension == "json" &&
                 ($0.lastPathComponent.hasPrefix("item_") || $0.lastPathComponent.hasPrefix("combined_item_"))
             }
-
+            
             var enqueued = 0
             for itemURL in itemFiles {
                 guard let attrs = try? FileManager.default.attributesOfItem(atPath: itemURL.path),
                       let mdate = attrs[.modificationDate] as? Date else { continue }
                 let age = Date().timeIntervalSince(mdate)
                 if age < Self.outboxMinRetryAge { continue }
-
+                
                 guard let data = try? Data(contentsOf: itemURL),
                       let item = try? JSONDecoder().decode(OutboxItem.self, from: data) else {
                     try? FileManager.default.removeItem(at: itemURL)
                     continue
                 }
-
+                
                 let payloadURL = URL(fileURLWithPath: item.payloadPath)
                 guard FileManager.default.fileExists(atPath: payloadURL.path) else {
                     // Orphaned metadata without a payload - clean up
                     try? FileManager.default.removeItem(at: itemURL)
                     continue
                 }
-
+                
                 if age > Self.outboxMaxItemAge {
                     self.logMessage("Outbox: dropping stale item (\(Int(age / 3600))h old)")
                     try? FileManager.default.removeItem(at: payloadURL)
@@ -477,20 +357,23 @@ extension OpenWearablesHealthSDK {
                     try? FileManager.default.removeItem(at: itemURL)
                     continue
                 }
-
+                
                 if inFlightPayloadPaths.contains(payloadURL.path) { continue }
-
-                var req = URLRequest(url: endpoint)
-                req.httpMethod = "POST"
-                req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-                self.applyAuth(to: &req, credential: credential)
-
+                
+                let itemId = itemURL.deletingPathExtension().lastPathComponent
+                let req = self.buildRequest(
+                    url: endpoint,
+                    credential: credential,
+                    requestId: UUID().uuidString,
+                    outboxItemId: itemId
+                )
+                
                 let task = self.session.uploadTask(with: req, fromFile: payloadURL)
-                task.taskDescription = [itemURL.path, payloadURL.path, item.anchorPath ?? ""].joined(separator: "|")
+                task.taskDescription = [itemURL.path, payloadURL.path, item.anchorPath ?? "", "\(self.currentSessionEpoch())"].joined(separator: "|")
                 task.resume()
                 enqueued += 1
             }
-
+            
             if enqueued > 0 {
                 self.logMessage("Outbox: enqueued \(enqueued) pending upload(s) to background session")
             }
