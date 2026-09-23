@@ -44,6 +44,17 @@ final class SyncSessionTrackingTests: XCTestCase {
         }
     }
 
+    func testClearPermanentSyncFailureDropsOnlyPausedSession() {
+        withIsolatedSDK { sdk, _ in
+            sdk.recordPermanentSyncFailure(statusCode: 422)
+
+            XCTAssertEqual(sdk.loadSyncState()?.permanentFailureStatusCode, 422)
+            XCTAssertTrue(sdk.clearPermanentSyncFailure())
+            XCTAssertNil(sdk.loadSyncState())
+            XCTAssertFalse(sdk.clearPermanentSyncFailure())
+        }
+    }
+
     func testStateWrittenBeforeSessionIdStillDecodesAndGetsOne() {
         withIsolatedSDK { sdk, _ in
             let legacy = LegacySyncState(
