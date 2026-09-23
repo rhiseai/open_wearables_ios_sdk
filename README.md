@@ -26,7 +26,7 @@ Add to your `Package.swift`:
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/the-momentum/OpenWearablesHealthSDK.git", from: "0.1.0")
+    .package(url: "https://github.com/rhiseai/open_wearables_ios_sdk.git", branch: "master")
 ]
 ```
 

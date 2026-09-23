@@ -23,6 +23,9 @@ struct SyncState: Codable {
     /// Stable for one historical or live run. Optional so a state file written
     /// before this field existed still decodes; the next attribution call fills it in.
     var sessionId: String?
+    /// Stable client rejections pause automatic retries until the host clears the session.
+    /// Optional so state files written by older SDK versions continue to decode.
+    var permanentFailureStatusCode: Int?
     
     var hasProgress: Bool {
         return totalSentCount > 0 || !completedTypes.isEmpty
@@ -116,6 +119,23 @@ extension OpenWearablesHealthSDK {
         state.currentTypeIndex = index
         saveSyncState(state)
     }
+
+    internal func recordPermanentSyncFailure(statusCode: Int) {
+        var state = loadSyncState() ?? SyncState(
+            userKey: userKey(),
+            fullExport: false,
+            createdAt: Date(),
+            typeProgress: [:],
+            totalSentCount: 0,
+            completedTypes: [],
+            currentTypeIndex: 0,
+            sessionId: UUID().uuidString,
+            permanentFailureStatusCode: nil
+        )
+        state.permanentFailureStatusCode = statusCode
+        saveSyncState(state)
+        logMessage("Sync paused after permanent HTTP \(statusCode); clear or reset the sync session before retrying")
+    }
     
     public func clearSyncSession() {
         try? FileManager.default.removeItem(at: syncStateFilePath())
@@ -147,7 +167,8 @@ extension OpenWearablesHealthSDK {
             totalSentCount: 0,
             completedTypes: [],
             currentTypeIndex: 0,
-            sessionId: UUID().uuidString
+            sessionId: UUID().uuidString,
+            permanentFailureStatusCode: nil
         )
         
         saveSyncState(state)
@@ -221,6 +242,8 @@ extension OpenWearablesHealthSDK {
                 "isFullExport": state.fullExport,
                 "initialExportDone": initialExportDone,
                 "isSyncing": isSyncingVisible,
+                "hasPermanentFailure": state.permanentFailureStatusCode != nil,
+                "permanentFailureStatusCode": (state.permanentFailureStatusCode as Any?) ?? NSNull(),
                 "createdAt": ISO8601DateFormatter().string(from: state.createdAt)
             ]
         } else {
@@ -231,6 +254,8 @@ extension OpenWearablesHealthSDK {
                 "isFullExport": false,
                 "initialExportDone": initialExportDone,
                 "isSyncing": isSyncingVisible,
+                "hasPermanentFailure": false,
+                "permanentFailureStatusCode": NSNull(),
                 "createdAt": NSNull()
             ]
         }

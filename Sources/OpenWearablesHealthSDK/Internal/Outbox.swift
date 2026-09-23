@@ -35,6 +35,13 @@ extension OpenWearablesHealthSDK {
     internal static func syncShouldAdvance(afterHTTPStatus statusCode: Int) -> Bool {
         (200...299).contains(statusCode)
     }
+
+    /// Retrying a stable client rejection with the same payload on every wake wastes
+    /// battery. Authentication, request timeout and throttling retain their dedicated
+    /// recovery paths and therefore do not pause the sync session.
+    internal static func syncShouldPause(afterHTTPStatus statusCode: Int) -> Bool {
+        (400...499).contains(statusCode) && ![401, 403, 408, 429].contains(statusCode)
+    }
     
     internal func uploadCombinedPayload(
         payload: [String: Any],
@@ -97,6 +104,10 @@ extension OpenWearablesHealthSDK {
                     completion: completion
                 )
                 return
+            }
+
+            if OpenWearablesHealthSDK.syncShouldPause(afterHTTPStatus: statusCode) {
+                self.recordPermanentSyncFailure(statusCode: statusCode)
             }
             
             if let data = data, let errorBody = String(data: data, encoding: .utf8), !errorBody.isEmpty {
@@ -178,6 +189,9 @@ extension OpenWearablesHealthSDK {
                     
                     if let retryStatus = retryStatus, (401...403).contains(retryStatus) {
                         self.emitAuthError(statusCode: retryStatus)
+                    } else if let retryStatus = retryStatus,
+                              OpenWearablesHealthSDK.syncShouldPause(afterHTTPStatus: retryStatus) {
+                        self.recordPermanentSyncFailure(statusCode: retryStatus)
                     }
                     completion(false)
                 }

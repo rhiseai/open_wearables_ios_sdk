@@ -4,6 +4,7 @@
 
 * **Rhise fork health types**: authorize and sync `basalBodyTemperature`, `dietaryFiber`, `dietarySugar`, and `dietaryCaffeine` with their default HealthKit units.
 * **Rhise foreground sync API**: `syncNow(completion:)` starts a fresh anchor-based round after the initial export while preserving an unfinished full export.
+* **Rhise terminal-failure guard**: stable 4xx payload rejections pause automatic and recent-window sync until the host clears the session.
 
 ## 0.15.0
 

@@ -42,6 +42,16 @@ final class OpenWearablesHealthSDKTests: XCTestCase {
         XCTAssertFalse(OpenWearablesHealthSDK.syncShouldAdvance(afterHTTPStatus: 0))
     }
 
+    func testSyncPausesOnlyForStableClientRejections() {
+        XCTAssertTrue(OpenWearablesHealthSDK.syncShouldPause(afterHTTPStatus: 400))
+        XCTAssertTrue(OpenWearablesHealthSDK.syncShouldPause(afterHTTPStatus: 422))
+        XCTAssertFalse(OpenWearablesHealthSDK.syncShouldPause(afterHTTPStatus: 401))
+        XCTAssertFalse(OpenWearablesHealthSDK.syncShouldPause(afterHTTPStatus: 403))
+        XCTAssertFalse(OpenWearablesHealthSDK.syncShouldPause(afterHTTPStatus: 408))
+        XCTAssertFalse(OpenWearablesHealthSDK.syncShouldPause(afterHTTPStatus: 429))
+        XCTAssertFalse(OpenWearablesHealthSDK.syncShouldPause(afterHTTPStatus: 500))
+    }
+
     func testConfigureWithTokenRefreshURLPersistsOverride() {
         let sdk = OpenWearablesHealthSDK.shared
         let refreshURL = "https://auth.example.com/v1/wearables/session"
@@ -294,7 +304,8 @@ final class OpenWearablesHealthSDKTests: XCTestCase {
             totalSentCount: 0,
             completedTypes: [],
             currentTypeIndex: 0,
-            sessionId: nil
+            sessionId: nil,
+            permanentFailureStatusCode: nil
         )
 
         XCTAssertTrue(

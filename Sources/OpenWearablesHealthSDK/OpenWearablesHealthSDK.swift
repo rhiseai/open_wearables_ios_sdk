@@ -664,15 +664,14 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
     }
     
     /// Re-read a recent window of HealthKit data with a non-anchored query and
-    /// enqueue it for upload, independently of the anchor-based incremental sync.
+    /// upload it independently of the anchor-based incremental sync.
     ///
     /// Incremental sync (``syncNow``) only returns samples inserted after the saved
     /// anchor, so samples written to HealthKit late for recent days are never re-read
     /// once the anchor has advanced past them. Call this periodically (alongside
     /// background sync) with the timestamp of the previous catch-up minus a small
     /// overlap, to re-upload everything since then; the server upserts, so duplicates
-    /// are harmless and partial days fill in. Anchors, the sync session and the
-    /// outbox are left untouched.
+    /// are harmless and partial days fill in. Saved HealthKit anchors are left untouched.
     ///
     /// - Parameters:
     ///   - sinceMillis: Unix epoch in milliseconds; samples with a start date at or
@@ -680,7 +679,7 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
     ///   - types: Optional subset of ``HealthDataType`` to re-read. Intersected with
     ///     currently tracked queryable types. `nil` (the default) re-reads every
     ///     tracked type — the historical behaviour. An empty array matches nothing.
-    ///   - completion: Called with `true` when the window upload was enqueued (or there was nothing to send).
+    ///   - completion: Called with `true` when every window chunk was uploaded (or there was nothing to send).
     public func syncRecentWindow(sinceMillis: Double, types: [HealthDataType]? = nil, completion: @escaping (Bool) -> Void) {
         guard userId != nil, hasAuth, let endpoint = syncEndpoint, let credential = authCredential else {
             logMessage("syncRecentWindow: not signed in")
@@ -702,6 +701,16 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         }
         guard !sampleTypes.isEmpty else {
             logMessage("syncRecentWindow: no queryable types")
+            completion(false)
+            return
+        }
+        if let statusCode = loadSyncState()?.permanentFailureStatusCode {
+            logMessage("syncRecentWindow: paused after permanent HTTP \(statusCode)")
+            completion(false)
+            return
+        }
+        guard let generation = beginSyncRun() else {
+            logMessage("syncRecentWindow: another sync is in progress")
             completion(false)
             return
         }
@@ -739,20 +748,61 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
             guard let self = self else { completion(false); return }
             guard !collected.isEmpty else {
                 self.logMessage("syncRecentWindow: nothing to re-upload")
+                self.finishSync(generation: generation)
                 completion(true)
                 return
             }
-            let payload = self.serializeCombinedStreaming(samples: collected)
-            self.enqueueCombinedUpload(
-                payload: payload,
-                anchors: [:],
+            let chunks = stride(from: 0, to: collected.count, by: self.recordsPerChunk).map {
+                Array(collected[$0..<min($0 + self.recordsPerChunk, collected.count)])
+            }
+            self.uploadRecentWindowChunks(
+                chunks,
+                index: 0,
                 endpoint: endpoint,
                 credential: credential,
-                wasFullExport: false
+                generation: generation
             ) { ok in
-                self.logMessage("syncRecentWindow: enqueued \(collected.count) samples (ok=\(ok))")
+                self.finishSync(generation: generation)
+                self.logMessage("syncRecentWindow: processed \(collected.count) samples in \(chunks.count) chunk(s) (ok=\(ok))")
                 completion(ok)
             }
+        }
+    }
+
+    private func uploadRecentWindowChunks(
+        _ chunks: [[HKSample]],
+        index: Int,
+        endpoint: URL,
+        credential: String,
+        generation: Int,
+        completion: @escaping (Bool) -> Void
+    ) {
+        guard !isSyncCancelled(generation: generation) else {
+            completion(false)
+            return
+        }
+        guard index < chunks.count else {
+            completion(true)
+            return
+        }
+        uploadCombinedPayload(
+            payload: buildCombinedPayload(samples: chunks[index]),
+            endpoint: endpoint,
+            credential: credential,
+            generation: generation
+        ) { [weak self] success in
+            guard let self = self, success else {
+                completion(false)
+                return
+            }
+            self.uploadRecentWindowChunks(
+                chunks,
+                index: index + 1,
+                endpoint: endpoint,
+                credential: credential,
+                generation: generation,
+                completion: completion
+            )
         }
     }
 
@@ -910,6 +960,13 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         
         let existingState = loadSyncState()
         let fullDone = defaults.bool(forKey: fullDoneKey())
+
+        if let statusCode = existingState?.permanentFailureStatusCode {
+            logMessage("Sync remains paused after permanent HTTP \(statusCode); clear or reset the sync session to retry")
+            finishSync(generation: generation)
+            completion()
+            return
+        }
 
         let effectiveFullExport: Bool
         if let state = existingState, state.fullExport {
