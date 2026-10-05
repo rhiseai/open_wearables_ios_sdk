@@ -149,14 +149,95 @@ extension OpenWearablesHealthSDK {
             return
         }
 
-        var req = buildRequest(url: endpoint, credential: credential, requestId: UUID().uuidString)
+        let requestId = UUID().uuidString
+        var req = buildRequest(url: endpoint, credential: credential, requestId: requestId)
+        req.httpBody = data
+
+        let task = foregroundSession.dataTask(with: req) { [weak self] _, response, error in
+            guard let self = self else {
+                completion()
+                return
+            }
+            if let error = error {
+                self.logMessage("Sync log error: \(error.localizedDescription)")
+                completion()
+                return
+            }
+            let statusCode = (response as? HTTPURLResponse)?.statusCode
+            if let statusCode = statusCode {
+                self.logMessage("Sync log: HTTP \(statusCode)")
+            }
+            if statusCode == 401 {
+                self.handle401ForLog(
+                    endpoint: endpoint, sentCredential: credential, data: data,
+                    requestId: requestId, completion: completion
+                )
+                return
+            }
+            completion()
+        }
+        task.resume()
+    }
+
+    /// The start log is the first request of a full export, so it is the one that meets
+    /// an access token that expired while the app was idle. It refreshes through the
+    /// shared refresh lock and is sent once more under the same request id.
+    ///
+    /// A log is diagnostics: with API-key auth, a rejected refresh or a network error it
+    /// is dropped. It never raises `onAuthError` - the sync upload that follows owns that
+    /// decision and reaches it on its own request.
+    private func handle401ForLog(
+        endpoint: URL,
+        sentCredential: String,
+        data: Data,
+        requestId: String,
+        completion: @escaping () -> Void
+    ) {
+        if isApiKeyAuth {
+            logMessage("Sync log: 401 with apiKey auth - dropped")
+            completion()
+            return
+        }
+
+        // A burst of logs shares one expired token. Once one of them has refreshed it,
+        // the rest resend with the new token instead of refreshing again.
+        if let current = authCredential, current != sentCredential {
+            resendLog(endpoint: endpoint, credential: current, data: data, requestId: requestId, completion: completion)
+            return
+        }
+
+        attemptTokenRefresh { [weak self] result in
+            guard let self = self else {
+                completion()
+                return
+            }
+            guard case .success = result, let newCredential = self.authCredential else {
+                self.logMessage("Sync log: token refresh failed - dropped")
+                completion()
+                return
+            }
+            self.resendLog(
+                endpoint: endpoint, credential: newCredential, data: data,
+                requestId: requestId, completion: completion
+            )
+        }
+    }
+
+    private func resendLog(
+        endpoint: URL,
+        credential: String,
+        data: Data,
+        requestId: String,
+        completion: @escaping () -> Void
+    ) {
+        var req = buildRequest(url: endpoint, credential: credential, requestId: requestId)
         req.httpBody = data
 
         let task = foregroundSession.dataTask(with: req) { [weak self] _, response, error in
             if let error = error {
-                self?.logMessage("Sync log error: \(error.localizedDescription)")
+                self?.logMessage("Sync log retry error: \(error.localizedDescription)")
             } else if let httpResponse = response as? HTTPURLResponse {
-                self?.logMessage("Sync log: HTTP \(httpResponse.statusCode)")
+                self?.logMessage("Sync log retry: HTTP \(httpResponse.statusCode)")
             }
             completion()
         }
