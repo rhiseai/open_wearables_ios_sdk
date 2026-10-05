@@ -5,6 +5,7 @@
 * **Rhise fork health types**: authorize and sync `basalBodyTemperature`, `dietaryFiber`, `dietarySugar`, and `dietaryCaffeine` with their default HealthKit units.
 * **Rhise foreground sync API**: `syncNow(completion:)` starts a fresh anchor-based round after the initial export while preserving an unfinished full export.
 * **Rhise terminal-failure guard**: stable 4xx payload rejections pause automatic and recent-window sync until the host clears the session.
+* **Rhise log token refresh**: a `/logs` request rejected with 401 now refreshes the access token through the shared refresh lock and is sent once more under the same request id, like a sync upload. The start log is the first request of a full export, so before this it always met a token that expired while the app was idle, and every log of the run was rejected. With API-key auth, a rejected refresh or a network error the log is dropped; it never raises `onAuthError`, which stays with the sync upload.
 
 ## 0.15.0
 
