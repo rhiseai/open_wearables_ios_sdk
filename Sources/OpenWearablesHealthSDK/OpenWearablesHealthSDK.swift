@@ -721,6 +721,7 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
 
         let collectLock = NSLock()
         var collected: [HKSample] = []
+        var queryFailed = false
         let group = DispatchGroup()
 
         for type in sampleTypes {
@@ -733,6 +734,9 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
             ) { [weak self] _, samples, error in
                 if let error = error {
                     self?.logMessage("syncRecentWindow: \(self?.shortTypeName(type.identifier) ?? type.identifier) error: \(error.localizedDescription)")
+                    collectLock.lock()
+                    queryFailed = true
+                    collectLock.unlock()
                 }
                 if let samples = samples, !samples.isEmpty {
                     collectLock.lock()
@@ -746,6 +750,14 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
 
         group.notify(queue: DispatchQueue.global()) { [weak self] in
             guard let self = self else { completion(false); return }
+            collectLock.lock()
+            let failed = queryFailed
+            collectLock.unlock()
+            guard !failed else {
+                self.finishSync(generation: generation)
+                completion(false)
+                return
+            }
             guard !collected.isEmpty else {
                 self.logMessage("syncRecentWindow: nothing to re-upload")
                 self.finishSync(generation: generation)
