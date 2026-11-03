@@ -102,8 +102,9 @@ extension OpenWearablesHealthSDK {
     /// Completes `task` when the sync ends rather than after a fixed wait. The old 20s / 25s
     /// wait marked the task done while the round was still uploading, so iOS suspended the
     /// app mid-upload, and a processing task, which can run for minutes, used a fraction of
-    /// its time. If iOS ends the task first, the expiration handler cancels the uploads and
-    /// the round resumes on the next wake, since `SyncState` only advances on a 2xx.
+    /// its time. If iOS ends the task first, the expiration handler cancels the run, so its
+    /// slot can be taken over on the next wake instead of blocking it, and the round resumes
+    /// from `SyncState`, which only advances on a 2xx.
     @available(iOS 13.0, *)
     private func runSyncInBackgroundTask(
         _ task: BGTask,
@@ -121,8 +122,8 @@ extension OpenWearablesHealthSDK {
         }
 
         task.expirationHandler = { [weak self] in
-            self?.logMessage("\(name) task expired - cancelling in-flight uploads")
-            self?.cancelInFlightSyncUploads(reason: "backgroundExpiration")
+            self?.logMessage("\(name) task expired - cancelling sync")
+            self?.cancelSync()
             complete(false)
         }
 

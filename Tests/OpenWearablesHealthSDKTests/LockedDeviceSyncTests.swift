@@ -3,7 +3,7 @@ import XCTest
 
 /// Covers the flag that carries a sync blocked by a locked device over to a later wake.
 /// The unlock notification only reaches a process that is still running, so the flag has
-/// to outlive the process, and the next run must take it over.
+/// to outlive the process, and only a run that sends every type may clear it.
 final class LockedDeviceSyncTests: XCTestCase {
 
     private let suiteName = "com.openwearables.healthsdk.state"
@@ -23,7 +23,9 @@ final class LockedDeviceSyncTests: XCTestCase {
         }
     }
 
-    func testTheNextSyncRunTakesOverTheDeferredSync() {
+    /// A run that ends before sending anything, here a cold start before `configure` has
+    /// restored the tracked types, must leave the flag for the next wake.
+    func testARunThatSendsNothingKeepsTheDeferredSync() {
         withIsolatedSDK { sdk, _ in
             let previous = sdk.pendingSyncAfterUnlock
             let previousTypes = sdk.trackedTypes
@@ -38,7 +40,7 @@ final class LockedDeviceSyncTests: XCTestCase {
             sdk.collectAllData(fullExport: false) { finished = true }
 
             XCTAssertTrue(finished, "with no tracked types the run ends before any HealthKit read")
-            XCTAssertFalse(sdk.pendingSyncAfterUnlock)
+            XCTAssertTrue(sdk.pendingSyncAfterUnlock)
         }
     }
 }

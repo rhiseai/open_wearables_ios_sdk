@@ -960,10 +960,6 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
             completion()
             return
         }
-
-        // This run covers whatever a locked device held back. If the device is still
-        // locked, the first HealthKit read fails and sets the flag again.
-        pendingSyncAfterUnlock = false
         
         guard HKHealthStore.isHealthDataAvailable() else {
             logMessage("HealthKit not available")
@@ -1059,6 +1055,9 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
                 
                 if allTypesCompleted {
                     self.finalizeSyncState()
+                    // Cleared only once every type is sent: a run cut off by expiration,
+                    // process death or the lock again must leave the next wake retrying.
+                    self.pendingSyncAfterUnlock = false
                 } else {
                     self.logMessage("Sync incomplete - will resume remaining types later")
                 }
@@ -1984,7 +1983,6 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
             self.logMessage("Device unlocked - protected data available")
             
             if self.pendingSyncAfterUnlock {
-                self.pendingSyncAfterUnlock = false
                 self.logMessage("Triggering deferred sync after unlock...")
                 
                 DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
