@@ -69,10 +69,14 @@ internal class OpenWearablesHealthSdkKeychain {
     // MARK: - Update Tokens (after refresh)
     
     static func updateTokens(accessToken: String, refreshToken: String?) {
-        save(key: accessTokenKey, value: accessToken)
+        // The refresh token first: the server has already replaced the old one, so if the
+        // process dies between the two writes, a new refresh token with an expired access
+        // token recovers on the next 401, while a new access token with a dead refresh
+        // token does not.
         if let refreshToken = refreshToken {
             save(key: refreshTokenKey, value: refreshToken)
         }
+        save(key: accessTokenKey, value: accessToken)
     }
     
     static func hasSession() -> Bool {
@@ -211,17 +215,20 @@ internal class OpenWearablesHealthSdkKeychain {
         
         guard let data = value.data(using: .utf8) else { return }
         
-        delete(key: key)
-        
-        let query: [String: Any] = [
+        // Update in place: a delete followed by an add loses the item when the add fails or
+        // the process dies between the two.
+        let match: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
-            kSecAttrAccount as String: key,
-            kSecValueData as String: data,
-            kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+            kSecAttrAccount as String: key
         ]
-        
-        let status = SecItemAdd(query as CFDictionary, nil)
+        var status = SecItemUpdate(match as CFDictionary, [kSecValueData as String: data] as CFDictionary)
+        if status == errSecItemNotFound {
+            var query = match
+            query[kSecValueData as String] = data
+            query[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+            status = SecItemAdd(query as CFDictionary, nil)
+        }
         if status != errSecSuccess {
             NSLog("[OpenWearablesHealthSDK] Keychain save failed for \(key): \(status)")
         }

@@ -95,9 +95,13 @@ extension OpenWearablesHealthSDK {
     }
 
     public func urlSessionDidFinishEvents(forBackgroundURLSession session: URLSession) {
+        // A token refresh a 401 above started holds its own background task, so the app keeps
+        // running until its response is stored even after this handler lets iOS go.
         if let handler = OpenWearablesHealthSDK.bgCompletionHandler {
             OpenWearablesHealthSDK.bgCompletionHandler = nil
-            handler()
+            // UIKit requires the completion handler on the main thread; this delegate runs on
+            // the background session's own queue.
+            DispatchQueue.main.async { handler() }
         }
     }
     
