@@ -85,57 +85,70 @@ extension OpenWearablesHealthSDK {
     @available(iOS 13.0, *)
     internal func handleAppRefresh(task: BGAppRefreshTask) {
         scheduleAppRefresh()
-        
-        let opQueue = OperationQueue()
-        let op = BlockOperation { [weak self] in
-            let group = DispatchGroup()
-            group.enter()
-            
-            self?.collectAllData(fullExport: false, isBackground: true) {
-                group.leave()
-            }
-            
-            let result = group.wait(timeout: .now() + 20)
-            if result == .timedOut {
-                self?.logMessage("BGAppRefresh sync timed out")
-            }
-        }
-
-        task.expirationHandler = {
-            self.logMessage("BGAppRefresh task expired - cancelling in-flight uploads")
-            self.cancelInFlightSyncUploads(reason: "backgroundExpiration")
-            op.cancel()
-        }
-        op.completionBlock = { task.setTaskCompleted(success: !op.isCancelled) }
-        opQueue.addOperation(op)
+        runBackgroundSync(
+            label: "BGAppRefresh",
+            retryOutbox: false,
+            setExpirationHandler: { task.expirationHandler = $0 },
+            complete: { task.setTaskCompleted(success: $0) }
+        )
     }
 
     @available(iOS 13.0, *)
     internal func handleProcessing(task: BGProcessingTask) {
         scheduleProcessing()
-        
-        let opQueue = OperationQueue()
-        let op = BlockOperation { [weak self] in
-            let group = DispatchGroup()
-            group.enter()
-            
-            self?.retryOutboxIfPossible()
-            self?.collectAllData(fullExport: false, isBackground: true) {
-                group.leave()
-            }
-            
-            let result = group.wait(timeout: .now() + 25)
-            if result == .timedOut {
-                self?.logMessage("BGProcessing sync timed out")
-            }
+        runBackgroundSync(
+            label: "BGProcessing",
+            retryOutbox: true,
+            setExpirationHandler: { task.expirationHandler = $0 },
+            complete: { task.setTaskCompleted(success: $0) }
+        )
+    }
+
+    /// Runs one background sync and completes its task when the run unwinds, not after a fixed
+    /// 20s / 25s wait. A task completed while the run was still going let iOS suspend the app
+    /// mid-run, in the middle of a token refresh too, whose response was then never stored, and
+    /// a processing task, which may run for minutes, used a fraction of its time.
+    ///
+    /// The run stops on its own before the background time runs out ("Background time low").
+    /// If iOS ends the task first, the expiration handler cancels the run's uploads, which
+    /// leaves cursors in place because `SyncState` only advances on a 2xx. The task completes
+    /// exactly once, from the run or from the expiration handler.
+    internal func runBackgroundSync(
+        label: String,
+        retryOutbox: Bool,
+        setExpirationHandler: (@escaping () -> Void) -> Void,
+        complete: @escaping (Bool) -> Void
+    ) {
+        let completion = BackgroundTaskCompletion(complete)
+        setExpirationHandler { [weak self] in
+            self?.logMessage("\(label) task expired - cancelling in-flight uploads")
+            self?.cancelInFlightSyncUploads(reason: "backgroundExpiration")
+            completion.finish(success: false)
         }
 
-        task.expirationHandler = {
-            self.logMessage("BGProcessing task expired - cancelling in-flight uploads")
-            self.cancelInFlightSyncUploads(reason: "backgroundExpiration")
-            op.cancel()
+        if retryOutbox { retryOutboxIfPossible() }
+        collectAllData(fullExport: false, isBackground: true) {
+            completion.finish(success: true)
         }
-        op.completionBlock = { task.setTaskCompleted(success: !op.isCancelled) }
-        opQueue.addOperation(op)
+    }
+}
+
+/// Completes a background task once, whichever of the run and the expiration handler gets
+/// there first.
+internal final class BackgroundTaskCompletion {
+    private let lock = NSLock()
+    private var done = false
+    private let complete: (Bool) -> Void
+
+    init(_ complete: @escaping (Bool) -> Void) {
+        self.complete = complete
+    }
+
+    func finish(success: Bool) {
+        lock.lock()
+        let first = !done
+        done = true
+        lock.unlock()
+        if first { complete(success) }
     }
 }

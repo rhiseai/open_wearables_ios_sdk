@@ -68,6 +68,13 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
     private var isRefreshingToken = false
     private let tokenRefreshLock = NSLock()
     private var tokenRefreshCallbacks: [(TokenRefreshResult) -> Void] = []
+    /// The assertion that keeps the process running until the refresh response is stored,
+    /// and the request it waits for. Guarded by `tokenRefreshLock`.
+    private var tokenRefreshBgTask: UIBackgroundTaskIdentifier = .invalid
+    private var tokenRefreshTask: URLSessionDataTask?
+
+    /// Begins and ends UIKit background tasks. Replaced in tests.
+    internal var backgroundTaskHost: BackgroundTaskHost = ApplicationBackgroundTaskHost()
     
     // MARK: - Auth Helpers
     
@@ -157,7 +164,13 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
     // Debouncing
     private var pendingSyncWorkItem: DispatchWorkItem?
     private let syncDebounceQueue = DispatchQueue(label: "health_sync_debounce")
+    /// Keeps an observer-driven sync running in the background. Ended by the run that
+    /// owns the sync slot when it unwinds, never by a trigger that found the slot taken.
     private var observerBgTask: UIBackgroundTaskIdentifier = .invalid
+    /// An observer sync is scheduled but has not started yet, so the assertion must outlive
+    /// whatever run is in the slot now. Guarded by `observerBgTaskLock`.
+    private var observerSyncPending = false
+    private let observerBgTaskLock = NSLock()
     
     // Sync flags
     internal var isInitialSyncInProgress = false
@@ -909,33 +922,73 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
             return
         }
         
-        if observerBgTask == .invalid {
-            observerBgTask = UIApplication.shared.beginBackgroundTask(withName: "health_combined_sync") {
-                self.logMessage("Background task expired - cancelling in-flight uploads")
-                self.cancelInFlightSyncUploads(reason: "backgroundExpiration")
-                UIApplication.shared.endBackgroundTask(self.observerBgTask)
-                self.observerBgTask = .invalid
-            }
-        }
+        beginObserverBgTaskIfNeeded()
         
         pendingSyncWorkItem?.cancel()
         
         let workItem = DispatchWorkItem { [weak self] in
             guard let self = self else { return }
+            self.setObserverSyncPending(false)
             self.syncAll(fullExport: false) {
-                if self.observerBgTask != .invalid {
-                    UIApplication.shared.endBackgroundTask(self.observerBgTask)
-                    self.observerBgTask = .invalid
-                }
+                // A trigger that found another run in the slot leaves the assertion to
+                // that run, which ends it from `finishSync` when it unwinds.
+                self.endObserverBgTaskIfIdle()
             }
         }
         
         pendingSyncWorkItem = workItem
+        setObserverSyncPending(true)
         syncDebounceQueue.asyncAfter(deadline: .now() + 2.0, execute: workItem)
     }
     
     internal func collectAllData(fullExport: Bool, completion: @escaping () -> Void) {
         collectAllData(fullExport: fullExport, isBackground: false, completion: completion)
+    }
+
+    private func beginObserverBgTaskIfNeeded() {
+        observerBgTaskLock.lock()
+        defer { observerBgTaskLock.unlock() }
+        guard observerBgTask == .invalid else { return }
+        observerBgTask = backgroundTaskHost.beginBackgroundTask(withName: "health_combined_sync") { [weak self] in
+            guard let self = self else { return }
+            self.logMessage("Background task expired - cancelling in-flight uploads")
+            self.cancelInFlightSyncUploads(reason: "backgroundExpiration")
+            self.endObserverBgTask()
+        }
+    }
+
+    private func setObserverSyncPending(_ pending: Bool) {
+        observerBgTaskLock.lock()
+        observerSyncPending = pending
+        observerBgTaskLock.unlock()
+    }
+
+    private func endObserverBgTask() {
+        observerBgTaskLock.lock()
+        let identifier = observerBgTask
+        observerBgTask = .invalid
+        observerSyncPending = false
+        observerBgTaskLock.unlock()
+        if identifier != .invalid {
+            backgroundTaskHost.endBackgroundTask(identifier)
+        }
+    }
+
+    /// Ends the observer assertion unless a run still owns the sync slot or an observer sync
+    /// is waiting to start. Must not be called while holding `syncLock`.
+    internal func endObserverBgTaskIfIdle() {
+        guard !isSyncInProgress else { return }
+        observerBgTaskLock.lock()
+        let pending = observerSyncPending
+        observerBgTaskLock.unlock()
+        guard !pending else { return }
+        endObserverBgTask()
+    }
+
+    internal var hasObserverBgTask: Bool {
+        observerBgTaskLock.lock()
+        defer { observerBgTaskLock.unlock() }
+        return observerBgTask != .invalid
     }
     
     internal func collectAllData(fullExport: Bool, isBackground: Bool, completion: @escaping () -> Void) {
@@ -1593,11 +1646,18 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
     /// must not clear it, otherwise it would let a third run start on top of a live one.
     internal func finishSync(generation: Int) {
         syncLock.lock()
-        defer { syncLock.unlock() }
-        guard generation == syncGeneration else { return }
+        guard generation == syncGeneration else {
+            syncLock.unlock()
+            return
+        }
         isSyncing = false
         isInitialSyncInProgress = false
         cancelRequestedAt = nil
+        syncLock.unlock()
+
+        // The run that owned the slot is done; the observer assertion it kept alive is not
+        // needed any more, whichever trigger began it.
+        endObserverBgTaskIfIdle()
     }
     
     /// Returns the remaining background execution time when the app is in the
@@ -1684,10 +1744,7 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
             for task in tasks { task.cancel() }
         }
         
-        if observerBgTask != .invalid {
-            UIApplication.shared.endBackgroundTask(observerBgTask)
-            observerBgTask = .invalid
-        }
+        endObserverBgTask()
         
         logMessage("Sync cancelled")
     }
@@ -1843,7 +1900,38 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
             self.finishTokenRefresh(result: .success)
         }
         
+        holdTokenRefresh(task)
         task.resume()
+    }
+
+    /// Keeps the process running until the refresh response is read and stored. The server
+    /// rotates the refresh token as soon as the request reaches it, so a response lost to
+    /// suspension leaves the Keychain holding a token the server has already replaced.
+    private func holdTokenRefresh(_ task: URLSessionDataTask) {
+        let identifier = backgroundTaskHost.beginBackgroundTask(withName: "ow_token_refresh") { [weak self] in
+            self?.expireTokenRefreshHold()
+        }
+        tokenRefreshLock.lock()
+        tokenRefreshBgTask = identifier
+        tokenRefreshTask = task
+        tokenRefreshLock.unlock()
+    }
+
+    /// iOS is about to suspend the app: cancel the refresh so its callback runs now, as a
+    /// network error, instead of after the next wake, and give the assertion back.
+    private func expireTokenRefreshHold() {
+        tokenRefreshLock.lock()
+        let identifier = tokenRefreshBgTask
+        let task = tokenRefreshTask
+        tokenRefreshBgTask = .invalid
+        tokenRefreshTask = nil
+        tokenRefreshLock.unlock()
+
+        logMessage("Token refresh background time expired - cancelling the refresh")
+        task?.cancel()
+        if identifier != .invalid {
+            backgroundTaskHost.endBackgroundTask(identifier)
+        }
     }
     
     private func finishTokenRefresh(result: TokenRefreshResult) {
@@ -1851,10 +1939,17 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         let callbacks = tokenRefreshCallbacks
         tokenRefreshCallbacks = []
         isRefreshingToken = false
+        let identifier = tokenRefreshBgTask
+        tokenRefreshBgTask = .invalid
+        tokenRefreshTask = nil
         tokenRefreshLock.unlock()
         
         for callback in callbacks {
             callback(result)
+        }
+        // Ended after the callbacks so the retry they start begins while the app still runs.
+        if identifier != .invalid {
+            backgroundTaskHost.endBackgroundTask(identifier)
         }
     }
     
