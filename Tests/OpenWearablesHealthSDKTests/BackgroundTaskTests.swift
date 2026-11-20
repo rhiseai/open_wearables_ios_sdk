@@ -87,6 +87,7 @@ final class BackgroundTaskTests: XCTestCase {
 
             sdk.runBackgroundSync(
                 label: "test",
+                trigger: .appRefresh,
                 retryOutbox: false,
                 setExpirationHandler: { expire = $0 },
                 complete: { completions.append($0) }

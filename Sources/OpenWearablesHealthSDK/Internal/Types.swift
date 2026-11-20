@@ -1,3 +1,4 @@
+import CoreLocation
 import Foundation
 import HealthKit
 
@@ -30,6 +31,8 @@ public enum HealthDataType: String, CaseIterable, Sendable {
     case heartRate
     case restingHeartRate
     case heartRateVariabilitySDNN
+    case heartRateVariabilityRMSSD // iOS 27.0+
+    case heartRateRecoveryOneMinute
     case vo2Max
     case oxygenSaturation
     case respiratoryRate
@@ -43,6 +46,9 @@ public enum HealthDataType: String, CaseIterable, Sendable {
     case waistCircumference
     case bodyTemperature
     case basalBodyTemperature
+    /// Overnight wrist-temperature samples recorded by Apple Watch (Series 8 and later, iOS 16+).
+    /// Distinct from `bodyTemperature`, which carries manual thermometer readings.
+    case appleSleepingWristTemperature
     
     // Blood & Metabolic
     case bloodGlucose
@@ -61,15 +67,47 @@ public enum HealthDataType: String, CaseIterable, Sendable {
     case ovulationTestResult
     case sexualActivity
     
-    // Nutrition
+    // Nutrition — HealthKit dietary quantity types (all 39)
     case dietaryEnergyConsumed
     case dietaryCarbohydrates
-    case dietaryProtein
-    case dietaryFatTotal
-    case dietaryWater
     case dietaryFiber
     case dietarySugar
+    case dietaryProtein
+    case dietaryFatTotal
+    case dietaryFatSaturated
+    case dietaryFatMonounsaturated
+    case dietaryFatPolyunsaturated
+    case dietaryCholesterol
+    case dietarySodium
+    case dietaryPotassium
+    case dietaryChloride
     case dietaryCaffeine
+    case dietaryCalcium
+    case dietaryIron
+    case dietaryMagnesium
+    case dietaryPhosphorus
+    case dietaryVitaminA
+    case dietaryVitaminB6
+    case dietaryVitaminB12
+    case dietaryVitaminC
+    case dietaryVitaminD
+    case dietaryVitaminE
+    case dietaryVitaminK
+    case dietaryThiamin
+    case dietaryRiboflavin
+    case dietaryNiacin
+    case dietaryFolate
+    case dietaryBiotin
+    case dietaryPantothenicAcid
+    case dietaryZinc
+    case dietaryCopper
+    case dietaryManganese
+    case dietarySelenium
+    case dietaryChromium
+    case dietaryMolybdenum
+    case dietaryIodine
+    case dietaryWater
+    case food
     
     // Running Dynamics (iOS 16.0+) — sensor-derived, not computable from distance/steps
     case runningPower
@@ -84,6 +122,9 @@ public enum HealthDataType: String, CaseIterable, Sendable {
 
     // Workout
     case workout
+    /// GPS route of each synced workout (`workouts[].route`). Opt-in: only read when
+    /// requested, and only together with `.workout`. Not synced as records of its own.
+    case workoutRoute
 
     // Workout Effort (iOS 18.0+ / watchOS 11.0+)
     case workoutEffortScore
@@ -125,6 +166,20 @@ public enum HealthDataType: String, CaseIterable, Sendable {
             return HKObjectType.quantityType(forIdentifier: .restingHeartRate)
         case .heartRateVariabilitySDNN:
             return HKObjectType.quantityType(forIdentifier: .heartRateVariabilitySDNN)
+        case .heartRateVariabilityRMSSD:
+            // The identifier only exists in the iOS 27 SDK, so older Xcode versions
+            // compile this type out instead of failing the build.
+            #if compiler(>=6.4)
+            if #available(iOS 27.0, *) {
+                return HKObjectType.quantityType(forIdentifier: .heartRateVariabilityRMSSD)
+            }
+            #endif
+            return nil
+        case .heartRateRecoveryOneMinute:
+            if #available(iOS 16.0, *) {
+                return HKObjectType.quantityType(forIdentifier: .heartRateRecoveryOneMinute)
+            }
+            return nil
         case .vo2Max:
             return HKObjectType.quantityType(forIdentifier: .vo2Max)
         case .oxygenSaturation, .bloodOxygen:
@@ -150,6 +205,11 @@ public enum HealthDataType: String, CaseIterable, Sendable {
             return HKObjectType.quantityType(forIdentifier: .bodyTemperature)
         case .basalBodyTemperature:
             return HKObjectType.quantityType(forIdentifier: .basalBodyTemperature)
+        case .appleSleepingWristTemperature:
+            if #available(iOS 16.0, *) {
+                return HKObjectType.quantityType(forIdentifier: .appleSleepingWristTemperature)
+            }
+            return nil
         case .bloodGlucose:
             return HKObjectType.quantityType(forIdentifier: .bloodGlucose)
         case .insulinDelivery:
@@ -179,18 +239,82 @@ public enum HealthDataType: String, CaseIterable, Sendable {
             return HKObjectType.quantityType(forIdentifier: .dietaryEnergyConsumed)
         case .dietaryCarbohydrates:
             return HKObjectType.quantityType(forIdentifier: .dietaryCarbohydrates)
-        case .dietaryProtein:
-            return HKObjectType.quantityType(forIdentifier: .dietaryProtein)
-        case .dietaryFatTotal:
-            return HKObjectType.quantityType(forIdentifier: .dietaryFatTotal)
-        case .dietaryWater:
-            return HKObjectType.quantityType(forIdentifier: .dietaryWater)
         case .dietaryFiber:
             return HKObjectType.quantityType(forIdentifier: .dietaryFiber)
         case .dietarySugar:
             return HKObjectType.quantityType(forIdentifier: .dietarySugar)
+        case .dietaryProtein:
+            return HKObjectType.quantityType(forIdentifier: .dietaryProtein)
+        case .dietaryFatTotal:
+            return HKObjectType.quantityType(forIdentifier: .dietaryFatTotal)
+        case .dietaryFatSaturated:
+            return HKObjectType.quantityType(forIdentifier: .dietaryFatSaturated)
+        case .dietaryFatMonounsaturated:
+            return HKObjectType.quantityType(forIdentifier: .dietaryFatMonounsaturated)
+        case .dietaryFatPolyunsaturated:
+            return HKObjectType.quantityType(forIdentifier: .dietaryFatPolyunsaturated)
+        case .dietaryCholesterol:
+            return HKObjectType.quantityType(forIdentifier: .dietaryCholesterol)
+        case .dietarySodium:
+            return HKObjectType.quantityType(forIdentifier: .dietarySodium)
+        case .dietaryPotassium:
+            return HKObjectType.quantityType(forIdentifier: .dietaryPotassium)
+        case .dietaryChloride:
+            return HKObjectType.quantityType(forIdentifier: .dietaryChloride)
         case .dietaryCaffeine:
             return HKObjectType.quantityType(forIdentifier: .dietaryCaffeine)
+        case .dietaryCalcium:
+            return HKObjectType.quantityType(forIdentifier: .dietaryCalcium)
+        case .dietaryIron:
+            return HKObjectType.quantityType(forIdentifier: .dietaryIron)
+        case .dietaryMagnesium:
+            return HKObjectType.quantityType(forIdentifier: .dietaryMagnesium)
+        case .dietaryPhosphorus:
+            return HKObjectType.quantityType(forIdentifier: .dietaryPhosphorus)
+        case .dietaryVitaminA:
+            return HKObjectType.quantityType(forIdentifier: .dietaryVitaminA)
+        case .dietaryVitaminB6:
+            return HKObjectType.quantityType(forIdentifier: .dietaryVitaminB6)
+        case .dietaryVitaminB12:
+            return HKObjectType.quantityType(forIdentifier: .dietaryVitaminB12)
+        case .dietaryVitaminC:
+            return HKObjectType.quantityType(forIdentifier: .dietaryVitaminC)
+        case .dietaryVitaminD:
+            return HKObjectType.quantityType(forIdentifier: .dietaryVitaminD)
+        case .dietaryVitaminE:
+            return HKObjectType.quantityType(forIdentifier: .dietaryVitaminE)
+        case .dietaryVitaminK:
+            return HKObjectType.quantityType(forIdentifier: .dietaryVitaminK)
+        case .dietaryThiamin:
+            return HKObjectType.quantityType(forIdentifier: .dietaryThiamin)
+        case .dietaryRiboflavin:
+            return HKObjectType.quantityType(forIdentifier: .dietaryRiboflavin)
+        case .dietaryNiacin:
+            return HKObjectType.quantityType(forIdentifier: .dietaryNiacin)
+        case .dietaryFolate:
+            return HKObjectType.quantityType(forIdentifier: .dietaryFolate)
+        case .dietaryBiotin:
+            return HKObjectType.quantityType(forIdentifier: .dietaryBiotin)
+        case .dietaryPantothenicAcid:
+            return HKObjectType.quantityType(forIdentifier: .dietaryPantothenicAcid)
+        case .dietaryZinc:
+            return HKObjectType.quantityType(forIdentifier: .dietaryZinc)
+        case .dietaryCopper:
+            return HKObjectType.quantityType(forIdentifier: .dietaryCopper)
+        case .dietaryManganese:
+            return HKObjectType.quantityType(forIdentifier: .dietaryManganese)
+        case .dietarySelenium:
+            return HKObjectType.quantityType(forIdentifier: .dietarySelenium)
+        case .dietaryChromium:
+            return HKObjectType.quantityType(forIdentifier: .dietaryChromium)
+        case .dietaryMolybdenum:
+            return HKObjectType.quantityType(forIdentifier: .dietaryMolybdenum)
+        case .dietaryIodine:
+            return HKObjectType.quantityType(forIdentifier: .dietaryIodine)
+        case .dietaryWater:
+            return HKObjectType.quantityType(forIdentifier: .dietaryWater)
+        case .food:
+            return HKObjectType.correlationType(forIdentifier: .food)
         case .runningPower:
             if #available(iOS 16.0, *) {
                 return HKObjectType.quantityType(forIdentifier: .runningPower)
@@ -228,6 +352,8 @@ public enum HealthDataType: String, CaseIterable, Sendable {
             return nil
         case .workout:
             return HKObjectType.workoutType()
+        case .workoutRoute:
+            return HKSeriesType.workoutRoute()
         case .workoutEffortScore:
             if #available(iOS 18.0, watchOS 11.0, *) {
                 return HKObjectType.quantityType(forIdentifier: .workoutEffortScore)
@@ -252,12 +378,21 @@ extension OpenWearablesHealthSDK {
     /// handed to `JSONSerialization` in one piece, so peak memory scales with the round.
     /// It is bounded by the round size instead - background rounds carry 100 records
     /// (~65 KB), and the 2000-record rounds only run in the foreground.
-    internal func buildCombinedPayload(samples: [HKSample]) -> [String: Any] {
+    ///
+    /// `knownFoodChildIds` are dietary samples that belong to a food correlation outside
+    /// this round (see `fetchFoodChildIds`). They are skipped here because the food
+    /// query sends them with `parentId`, in this round or another one.
+    internal func buildCombinedPayload(
+        samples: [HKSample],
+        knownFoodChildIds: Set<UUID> = [],
+        workoutRoutes: [UUID: [CLLocation]] = [:]
+    ) -> [String: Any] {
         var workouts: [[String: Any]] = []
         var records: [[String: Any]] = []
         var sleep: [[String: Any]] = []
-        
+
         let dateFormatter = ISO8601DateFormatter()
+        let foodChildIds = _foodChildIds(in: samples).union(knownFoodChildIds)
         
         let batchSize = 100
         for batchStart in stride(from: 0, to: samples.count, by: batchSize) {
@@ -267,8 +402,10 @@ extension OpenWearablesHealthSDK {
                 
                 for s in batch {
                     if let w = s as? HKWorkout {
-                        workouts.append(_mapWorkoutEfficient(w, dateFormatter: dateFormatter))
+                        workouts.append(_mapWorkoutEfficient(w, route: workoutRoutes[w.uuid], dateFormatter: dateFormatter))
                     } else if let q = s as? HKQuantitySample {
+                        // Sent as a child of HKCorrelationTypeFood (this round or another).
+                        if foodChildIds.contains(q.uuid) { continue }
                         records.append(_mapQuantityEfficient(q, dateFormatter: dateFormatter))
                     } else if let c = s as? HKCategorySample {
                         if c.categoryType.identifier == HKCategoryTypeIdentifier.sleepAnalysis.rawValue {
@@ -318,17 +455,96 @@ extension OpenWearablesHealthSDK {
     // MARK: - Type mapping
     
     internal func mapTypes(_ types: [HealthDataType]) -> [HKSampleType] {
-        return types.compactMap { $0.toHKSampleType() }
+        var mapped = types.compactMap { $0.toHKSampleType() }
+        // Dietary quantity types can belong to a food correlation. Always read that
+        // type as well so the parent record and parentId links can be built.
+        if types.contains(where: { $0.rawValue.hasPrefix("dietary") }),
+           let food = HKObjectType.correlationType(forIdentifier: .food),
+           !mapped.contains(where: { $0.identifier == food.identifier }) {
+            mapped.append(food)
+        }
+        return mapped
     }
     
     /// Legacy mapping from raw strings - used for restoring persisted types from Keychain.
     internal func mapTypesFromStrings(_ names: [String]) -> [HKSampleType] {
-        return names.compactMap { HealthDataType(rawValue: $0)?.toHKSampleType() }
+        // Go through mapTypes so restored dietary types bring the food correlation back too.
+        return mapTypes(names.compactMap { HealthDataType(rawValue: $0) })
     }
 
     // MARK: - Units / helpers
 
+    /// Both temperature identifiers share a unit; `appleSleepingWristTemperature` is iOS 16+, so the
+    /// match is by identifier rather than by a `case` in the switches below.
+    private func _isTemperatureQuantityType(_ qt: HKQuantityType) -> Bool {
+        if qt.identifier == HKQuantityTypeIdentifier.bodyTemperature.rawValue {
+            return true
+        }
+        if #available(iOS 16.0, *) {
+            return qt.identifier == HKQuantityTypeIdentifier.appleSleepingWristTemperature.rawValue
+        }
+        return false
+    }
+
+    /// Units HealthKit accepts for dietary quantities, as on a nutrition label.
+    /// Energy keeps `Cal` for the type already shipped; the rest are g / mg / mcg / L.
+    private func _dietaryUnit(for qt: HKQuantityType) -> (HKUnit, String)? {
+        let mg = HKUnit.gramUnit(with: .milli)
+        let mcg = HKUnit.gramUnit(with: .micro)
+        switch qt {
+        case HKObjectType.quantityType(forIdentifier: .dietaryEnergyConsumed):
+            return (.kilocalorie(), "Cal")
+        case HKObjectType.quantityType(forIdentifier: .dietaryWater):
+            return (.liter(), "L")
+        case HKObjectType.quantityType(forIdentifier: .dietaryCarbohydrates),
+             HKObjectType.quantityType(forIdentifier: .dietaryFiber),
+             HKObjectType.quantityType(forIdentifier: .dietarySugar),
+             HKObjectType.quantityType(forIdentifier: .dietaryProtein),
+             HKObjectType.quantityType(forIdentifier: .dietaryFatTotal),
+             HKObjectType.quantityType(forIdentifier: .dietaryFatSaturated),
+             HKObjectType.quantityType(forIdentifier: .dietaryFatMonounsaturated),
+             HKObjectType.quantityType(forIdentifier: .dietaryFatPolyunsaturated):
+            return (.gram(), "g")
+        case HKObjectType.quantityType(forIdentifier: .dietaryCholesterol),
+             HKObjectType.quantityType(forIdentifier: .dietarySodium),
+             HKObjectType.quantityType(forIdentifier: .dietaryPotassium),
+             HKObjectType.quantityType(forIdentifier: .dietaryChloride),
+             HKObjectType.quantityType(forIdentifier: .dietaryCaffeine),
+             HKObjectType.quantityType(forIdentifier: .dietaryCalcium),
+             HKObjectType.quantityType(forIdentifier: .dietaryIron),
+             HKObjectType.quantityType(forIdentifier: .dietaryMagnesium),
+             HKObjectType.quantityType(forIdentifier: .dietaryPhosphorus),
+             HKObjectType.quantityType(forIdentifier: .dietaryVitaminB6),
+             HKObjectType.quantityType(forIdentifier: .dietaryVitaminC),
+             HKObjectType.quantityType(forIdentifier: .dietaryVitaminE),
+             HKObjectType.quantityType(forIdentifier: .dietaryThiamin),
+             HKObjectType.quantityType(forIdentifier: .dietaryRiboflavin),
+             HKObjectType.quantityType(forIdentifier: .dietaryNiacin),
+             HKObjectType.quantityType(forIdentifier: .dietaryPantothenicAcid),
+             HKObjectType.quantityType(forIdentifier: .dietaryZinc),
+             HKObjectType.quantityType(forIdentifier: .dietaryCopper),
+             HKObjectType.quantityType(forIdentifier: .dietaryManganese):
+            return (mg, "mg")
+        case HKObjectType.quantityType(forIdentifier: .dietaryVitaminA),
+             HKObjectType.quantityType(forIdentifier: .dietaryVitaminB12),
+             HKObjectType.quantityType(forIdentifier: .dietaryVitaminD),
+             HKObjectType.quantityType(forIdentifier: .dietaryVitaminK),
+             HKObjectType.quantityType(forIdentifier: .dietaryFolate),
+             HKObjectType.quantityType(forIdentifier: .dietaryBiotin),
+             HKObjectType.quantityType(forIdentifier: .dietarySelenium),
+             HKObjectType.quantityType(forIdentifier: .dietaryChromium),
+             HKObjectType.quantityType(forIdentifier: .dietaryMolybdenum),
+             HKObjectType.quantityType(forIdentifier: .dietaryIodine):
+            return (mcg, "mcg")
+        default:
+            return nil
+        }
+    }
+
     private func _getFallbackUnit(for qt: HKQuantityType) -> HKUnit {
+        if _isTemperatureQuantityType(qt) {
+            return .degreeCelsius()
+        }
         switch qt {
         case HKObjectType.quantityType(forIdentifier: .stepCount):
             return .count()
@@ -352,7 +568,13 @@ extension OpenWearablesHealthSDK {
              HKObjectType.quantityType(forIdentifier: .bloodPressureDiastolic):
             return HKUnit.millimeterOfMercury()
         default:
+            if let unit = _dietaryUnit(for: qt)?.0 {
+                return unit
+            }
             if #available(iOS 16.0, *) {
+                if qt == HKObjectType.quantityType(forIdentifier: .heartRateRecoveryOneMinute) {
+                    return .count().unitDivided(by: .minute())
+                }
                 if qt == HKObjectType.quantityType(forIdentifier: .runningPower) {
                     return .watt()
                 }
@@ -381,11 +603,21 @@ extension OpenWearablesHealthSDK {
                     return .appleEffortScore()
                 }
             }
+            #if compiler(>=6.4)
+            if #available(iOS 27.0, *) {
+                if qt == HKObjectType.quantityType(forIdentifier: .heartRateVariabilityRMSSD) {
+                    return .secondUnit(with: .milli)
+                }
+            }
+            #endif
             return .count()
         }
     }
 
     private func _defaultUnit(for qt: HKQuantityType) -> (HKUnit, String) {
+        if _isTemperatureQuantityType(qt) {
+            return (.degreeCelsius(), "degC")
+        }
         switch qt {
         case HKObjectType.quantityType(forIdentifier: .stepCount):
             return (.count(), "count")
@@ -445,18 +677,17 @@ extension OpenWearablesHealthSDK {
             return (vo2Unit, "mL/kg/min")
         case HKObjectType.quantityType(forIdentifier: .flightsClimbed):
             return (.count(), "count")
-        case HKObjectType.quantityType(forIdentifier: .dietaryCarbohydrates),
-             HKObjectType.quantityType(forIdentifier: .dietaryProtein),
-             HKObjectType.quantityType(forIdentifier: .dietaryFatTotal),
-             HKObjectType.quantityType(forIdentifier: .dietaryFiber),
-             HKObjectType.quantityType(forIdentifier: .dietarySugar):
-            return (.gram(), "g")
-        case HKObjectType.quantityType(forIdentifier: .dietaryCaffeine):
-            return (.gramUnit(with: .milli), "mg")
-        case HKObjectType.quantityType(forIdentifier: .dietaryWater):
-            return (.liter(), "L")
         default:
+            if let dietary = _dietaryUnit(for: qt) {
+                return dietary
+            }
             if #available(iOS 16.0, *) {
+                if qt == HKObjectType.quantityType(forIdentifier: .heartRateRecoveryOneMinute) {
+                    // The drop is stored as count/min (Apple's docs say "count", but HealthKit
+                    // rejects .count() for this type and converting to it throws). Sent as bpm
+                    // like the other heart types (peak HR minus HR at +1 min).
+                    return (.count().unitDivided(by: .minute()), "bpm")
+                }
                 if qt == HKObjectType.quantityType(forIdentifier: .runningPower) {
                     return (.watt(), "W")
                 }
@@ -485,6 +716,13 @@ extension OpenWearablesHealthSDK {
                     return (.appleEffortScore(), "appleEffortScore")
                 }
             }
+            #if compiler(>=6.4)
+            if #available(iOS 27.0, *) {
+                if qt == HKObjectType.quantityType(forIdentifier: .heartRateVariabilityRMSSD) {
+                    return (.secondUnit(with: .milli), "ms")
+                }
+            }
+            #endif
             return (.count(), "count")
         }
     }
@@ -582,7 +820,25 @@ extension OpenWearablesHealthSDK {
     
     // MARK: - Memory-efficient mappers
     
-    private func _mapQuantityEfficient(_ q: HKQuantitySample, dateFormatter: ISO8601DateFormatter) -> [String: Any] {
+    internal func _foodChildIds(in samples: [HKSample]) -> Set<UUID> {
+        var ids = Set<UUID>()
+        for sample in samples {
+            guard let corr = sample as? HKCorrelation,
+                  corr.correlationType.identifier == HKCorrelationTypeIdentifier.food.rawValue else {
+                continue
+            }
+            for object in corr.objects {
+                ids.insert(object.uuid)
+            }
+        }
+        return ids
+    }
+
+    private func _mapQuantityEfficient(
+        _ q: HKQuantitySample,
+        dateFormatter: ISO8601DateFormatter,
+        parentId: Any = NSNull()
+    ) -> [String: Any] {
         let (unit, unitOut) = _defaultUnit(for: q.quantityType)
         
         var value: Double
@@ -597,7 +853,8 @@ extension OpenWearablesHealthSDK {
             finalUnit = fallbackUnit.unitString
         }
 
-        if q.quantityType.identifier == HKQuantityTypeIdentifier.oxygenSaturation.rawValue {
+        // HKUnit.percent() is a 0-1 fraction; "%" is sent on a 0-100 scale.
+        if finalUnit == "%" {
             value *= 100
         }
 
@@ -610,7 +867,7 @@ extension OpenWearablesHealthSDK {
             "source": _mapSource(q.sourceRevision, device: q.device),
             "value": value,
             "unit": finalUnit,
-            "parentId": NSNull(),
+            "parentId": parentId,
             "metadata": _metadataDict(q.metadata)
         ]
     }
@@ -645,6 +902,10 @@ extension OpenWearablesHealthSDK {
     }
 
     private func _mapCorrelationEfficient(_ corr: HKCorrelation, dateFormatter: ISO8601DateFormatter) -> [[String: Any]] {
+        if corr.correlationType.identifier == HKCorrelationTypeIdentifier.food.rawValue {
+            return _mapFoodCorrelation(corr, dateFormatter: dateFormatter)
+        }
+
         var records: [[String: Any]] = []
         let source = _mapSource(corr.sourceRevision, device: corr.device)
 
@@ -669,7 +930,34 @@ extension OpenWearablesHealthSDK {
         return records
     }
 
-    private func _mapWorkoutEfficient(_ w: HKWorkout, dateFormatter: ISO8601DateFormatter) -> [String: Any] {
+    /// Food stays in `records[]`: one parent row for the correlation, then each
+    /// dietary child with `parentId` = the food UUID. Title / meal type stay in
+    /// metadata — HealthKit does not guarantee them.
+    private func _mapFoodCorrelation(_ corr: HKCorrelation, dateFormatter: ISO8601DateFormatter) -> [[String: Any]] {
+        var records: [[String: Any]] = [[
+            "id": corr.uuid.uuidString,
+            "type": corr.correlationType.identifier,
+            "startDate": dateFormatter.string(from: corr.startDate),
+            "endDate": dateFormatter.string(from: corr.endDate),
+            "zoneOffset": _zoneOffsetString(metadata: corr.metadata, date: corr.startDate),
+            "source": _mapSource(corr.sourceRevision, device: corr.device),
+            "value": 1,
+            "unit": NSNull(),
+            "parentId": NSNull(),
+            "metadata": _foodMetadataDict(corr.metadata)
+        ]]
+
+        for sample in corr.objects {
+            if let q = sample as? HKQuantitySample {
+                records.append(_mapQuantityEfficient(q, dateFormatter: dateFormatter, parentId: corr.uuid.uuidString))
+            }
+        }
+        return records
+    }
+
+    private func _mapWorkoutEfficient(
+        _ w: HKWorkout, route: [CLLocation]?, dateFormatter: ISO8601DateFormatter
+    ) -> [String: Any] {
         let stats = _buildWorkoutStats(w)
 
         return [
@@ -685,10 +973,37 @@ extension OpenWearablesHealthSDK {
             "values": stats,
             "segments": NSNull(),
             "laps": _buildWorkoutLaps(w, dateFormatter: dateFormatter),
-            "route": NSNull(),
+            "route": _buildWorkoutRoute(route, dateFormatter: dateFormatter),
             "samples": NSNull(),
             "metadata": NSNull()
         ]
+    }
+
+    // MARK: - Workout route
+
+    /// Maps the `CLLocation`s of a workout's `HKWorkoutRoute` into the payload `route` array.
+    /// Locations with a negative horizontal accuracy carry no valid coordinates and are
+    /// dropped; altitude, speed and course are null when CoreLocation marks them invalid.
+    /// Returns `NSNull()` when there is no route (or route reading is not enabled).
+    internal func _buildWorkoutRoute(_ locations: [CLLocation]?, dateFormatter: ISO8601DateFormatter) -> Any {
+        guard let locations = locations else { return NSNull() }
+        let points: [[String: Any]] = locations
+            .filter { $0.horizontalAccuracy >= 0 }
+            .sorted { $0.timestamp < $1.timestamp }
+            .map { loc in
+                let hasAltitude = loc.verticalAccuracy >= 0
+                return [
+                    "timestamp": dateFormatter.string(from: loc.timestamp),
+                    "latitude": loc.coordinate.latitude,
+                    "longitude": loc.coordinate.longitude,
+                    "altitudeM": hasAltitude ? loc.altitude : NSNull(),
+                    "horizontalAccuracyM": loc.horizontalAccuracy,
+                    "verticalAccuracyM": hasAltitude ? loc.verticalAccuracy : NSNull(),
+                    "speedMps": loc.speed >= 0 ? loc.speed : NSNull(),
+                    "courseDeg": loc.course >= 0 ? loc.course : NSNull()
+                ]
+            }
+        return points.isEmpty ? NSNull() : points
     }
     
     // MARK: - Workout laps / events
@@ -832,22 +1147,31 @@ extension OpenWearablesHealthSDK {
         if let swimmingLocationType = w.metadata?[HKMetadataKeySwimmingLocationType] as? NSNumber { stats.append(["type": "swimmingLocationType", "value": swimmingLocationType.intValue, "unit": "enum"]) }
         if let indoorWorkout = w.metadata?[HKMetadataKeyIndoorWorkout] as? Bool { stats.append(["type": "indoorWorkout", "value": indoorWorkout ? 1 : 0, "unit": "bool"]) }
         if let weatherTemp = w.metadata?[HKMetadataKeyWeatherTemperature] as? HKQuantity { stats.append(["type": "weatherTemperature", "value": weatherTemp.doubleValue(for: .degreeCelsius()), "unit": "degC"]) }
-        if let weatherHumidity = w.metadata?[HKMetadataKeyWeatherHumidity] as? HKQuantity { stats.append(["type": "weatherHumidity", "value": weatherHumidity.doubleValue(for: .percent()), "unit": "%"]) }
+        if let weatherHumidity = w.metadata?[HKMetadataKeyWeatherHumidity] as? HKQuantity { stats.append(["type": "weatherHumidity", "value": weatherHumidity.doubleValue(for: .percent()) * 100, "unit": "%"]) }
         
         return stats
     }
     
     // MARK: - Source mapper (unified format)
     
+    // Bundle id prefix of samples written by Apple's own devices (iPhone, Apple Watch)
+    private static let appleOwnSourcePrefix = "com.apple.health."
+
     private func _mapSource(_ sourceRevision: HKSourceRevision, device: HKDevice?) -> [String: Any] {
+        // productType is the hardware the writer app ran on. It names the producing device only for
+        // Apple's own sources; for a third-party writer (e.g. Oura) it is the relaying iPhone, so the
+        // model comes from the HKDevice the writer attached, if any.
+        let isAppleOwn = sourceRevision.source.bundleIdentifier.hasPrefix(Self.appleOwnSourcePrefix)
+        let productType = isAppleOwn ? sourceRevision.productType : nil
+        let deviceModel = isAppleOwn ? productType : device?.model
         var result: [String: Any] = [
             "appId": sourceRevision.source.bundleIdentifier,
             "name": sourceRevision.source.name,
             "deviceId": NSNull(),
             "deviceName": (device?.name) as Any? ?? NSNull(),
             "deviceManufacturer": (device?.manufacturer) as Any? ?? NSNull(),
-            "deviceModel": (sourceRevision.productType) as Any? ?? NSNull(),
-            "deviceType": _inferDeviceType(productType: sourceRevision.productType, device: device),
+            "deviceModel": deviceModel as Any? ?? NSNull(),
+            "deviceType": _inferDeviceType(productType: productType, device: device),
             "recordingMethod": NSNull()
         ]
 
@@ -887,6 +1211,17 @@ extension OpenWearablesHealthSDK {
         }
         return result
     }
+
+    /// Food metadata uses stable payload keys: `title` (from `HKFoodType`) and `mealType`.
+    /// Neither is guaranteed by HealthKit — omit the key when the source left it out.
+    private func _foodMetadataDict(_ meta: [String: Any]?) -> Any {
+        guard var result = _metadataDict(meta) as? [String: Any] else { return NSNull() }
+        if result["title"] == nil, let foodType = result[HKMetadataKeyFoodType] {
+            result["title"] = foodType
+        }
+        result.removeValue(forKey: HKMetadataKeyFoodType)
+        return result.isEmpty ? NSNull() : result
+    }
     
     // MARK: - Zone Offset
     
@@ -921,4 +1256,42 @@ extension OpenWearablesHealthSDK {
         default: return "unknown"
         }
     }
+}
+
+// MARK: - Sync Attribution
+
+/// What started a sync run. Sent with every upload as `X-Open-Wearables-Sync-Trigger`,
+/// so server logs can tell HealthKit wake-ups from BGTasks and app launches.
+internal enum SyncTrigger: String {
+    /// `startBackgroundSync()` - first export or the incremental sync right after it.
+    case start
+    /// Interrupted sync resumed when a saved session is restored on launch.
+    case restore
+    /// `resumeSync()` called by the app.
+    case resume
+    /// Full export started by `resetAnchors()`.
+    case reset
+    /// HealthKit background delivery woke the app.
+    case healthKitObserver = "healthkit_observer"
+    case appRefresh = "bg_app_refresh"
+    case processing = "bg_processing"
+    /// Interrupted sync resumed when the app returned to the foreground.
+    case foreground
+    /// Deferred sync resumed after the device was unlocked.
+    case unlock
+    /// Sync resumed after the network came back.
+    case network
+    /// `syncNow()` called by the app (Rhise fork).
+    case syncNow = "sync_now"
+    /// `syncRecentWindow()` called by the app (Rhise fork).
+    case recentWindow = "recent_window"
+}
+
+/// Sync attribution sent as headers on an upload. Captured when the batch is built,
+/// so a 401 retry reports the same state as the original attempt.
+internal struct SyncRequestContext {
+    let inBackground: Bool
+    let trigger: SyncTrigger
+
+    var appState: String { inBackground ? "background" : "foreground" }
 }

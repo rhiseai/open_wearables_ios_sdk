@@ -1,3 +1,4 @@
+import CoreLocation
 import XCTest
 import HealthKit
 @testable import OpenWearablesHealthSDK
@@ -102,6 +103,170 @@ final class OpenWearablesHealthSDKTests: XCTestCase {
         )
     }
 
+    func testDietaryTypesMapToHealthKitQuantityIdentifiers() {
+        let dietary = HealthDataType.allCases.filter { $0.rawValue.hasPrefix("dietary") }
+        XCTAssertEqual(dietary.count, 39)
+
+        for type in dietary {
+            guard let sample = type.toHKSampleType() else {
+                XCTFail("\(type.rawValue) did not map to a HealthKit type")
+                continue
+            }
+            XCTAssertEqual(
+                sample.identifier,
+                "HKQuantityTypeIdentifier" + type.rawValue.prefix(1).uppercased() + type.rawValue.dropFirst()
+            )
+        }
+    }
+
+    func testFoodTypeMapsToHealthKitCorrelation() {
+        XCTAssertEqual(HealthDataType.food.rawValue, "food")
+        XCTAssertEqual(
+            HealthDataType.food.toHKSampleType()?.identifier,
+            HKCorrelationTypeIdentifier.food.rawValue
+        )
+    }
+
+    func testMapTypesAddsFoodWhenDietaryTypesAreRequested() {
+        let mapped = OpenWearablesHealthSDK.shared.mapTypes([.dietaryProtein, .steps])
+        XCTAssertTrue(mapped.contains { $0.identifier == HKCorrelationTypeIdentifier.food.rawValue })
+        XCTAssertTrue(mapped.contains { $0.identifier == HKQuantityTypeIdentifier.dietaryProtein.rawValue })
+    }
+
+    func testAuthorizationOmitsFoodCorrelationButSyncStillQueriesIt() {
+        let sdk = OpenWearablesHealthSDK.shared
+        let previous = sdk.trackedTypes
+        defer { sdk.trackedTypes = previous }
+
+        sdk.trackedTypes = sdk.mapTypes([.dietaryEnergyConsumed, .steps, .bloodPressure])
+        let authorized = sdk.typesForAuthorization()
+
+        XCTAssertFalse(authorized.contains { $0.identifier == HKCorrelationTypeIdentifier.food.rawValue })
+        XCTAssertFalse(authorized.contains { $0.identifier == HKCorrelationTypeIdentifier.bloodPressure.rawValue })
+        XCTAssertTrue(authorized.contains { $0.identifier == HKQuantityTypeIdentifier.dietaryEnergyConsumed.rawValue })
+        XCTAssertTrue(sdk.getQueryableTypes().contains { $0.identifier == HKCorrelationTypeIdentifier.food.rawValue })
+    }
+
+    /// The React Native bridge's authorization probe (Rhise fork) asks about the types an app
+    /// passes without tracking them, and must get the set `requestAuthorization` would read.
+    func testAuthorizationTypesOfRequestedTypesMatchWhatTrackingThemAuthorizes() {
+        let sdk = OpenWearablesHealthSDK.shared
+        let previous = sdk.trackedTypes
+        defer { sdk.trackedTypes = previous }
+        let requested = sdk.mapTypes([.dietaryProtein, .bloodPressure, .workout, .workoutRoute])
+
+        sdk.trackedTypes = []
+        let probed = sdk.typesForAuthorization(of: requested).map(\.identifier)
+        XCTAssertTrue(sdk.trackedTypes.isEmpty, "asking must not track the types")
+
+        sdk.trackedTypes = requested
+        XCTAssertEqual(probed, sdk.typesForAuthorization().map(\.identifier))
+        XCTAssertFalse(probed.contains(HKCorrelationTypeIdentifier.food.rawValue))
+        XCTAssertFalse(probed.contains(HKCorrelationTypeIdentifier.bloodPressure.rawValue))
+        XCTAssertTrue(probed.contains(HKSeriesType.workoutRoute().identifier))
+    }
+
+    func testFoodCorrelationEmitsParentAndChildrenInRecords() {
+        let start = Date(timeIntervalSince1970: 1_779_163_200) // 2026-05-18-ish just a fixed date
+        let energyType = HKQuantityType.quantityType(forIdentifier: .dietaryEnergyConsumed)!
+        let proteinType = HKQuantityType.quantityType(forIdentifier: .dietaryProtein)!
+        let caffeineType = HKQuantityType.quantityType(forIdentifier: .dietaryCaffeine)!
+
+        let energy = HKQuantitySample(
+            type: energyType,
+            quantity: HKQuantity(unit: .kilocalorie(), doubleValue: 550),
+            start: start,
+            end: start
+        )
+        let protein = HKQuantitySample(
+            type: proteinType,
+            quantity: HKQuantity(unit: .gram(), doubleValue: 38.2),
+            start: start,
+            end: start
+        )
+        let food = HKCorrelation(
+            type: HKObjectType.correlationType(forIdentifier: .food)!,
+            start: start,
+            end: start,
+            objects: [energy, protein],
+            metadata: [
+                HKMetadataKeyFoodType: "Kurczak z ryżem",
+                "mealType": "obiad"
+            ]
+        )
+        let caffeine = HKQuantitySample(
+            type: caffeineType,
+            quantity: HKQuantity(unit: HKUnit.gramUnit(with: .milli), doubleValue: 95),
+            start: start.addingTimeInterval(-10_800),
+            end: start.addingTimeInterval(-10_800)
+        )
+
+        let payload = OpenWearablesHealthSDK.shared.buildCombinedPayload(samples: [food, energy, caffeine])
+        let records = payload["data"] as? [String: Any]
+        let list = records?["records"] as? [[String: Any]] ?? []
+
+        let foodRow = list.first { $0["type"] as? String == HKCorrelationTypeIdentifier.food.rawValue }
+        XCTAssertNotNil(foodRow)
+        XCTAssertEqual(foodRow?["id"] as? String, food.uuid.uuidString)
+        XCTAssertEqual(foodRow?["value"] as? Int, 1)
+        XCTAssertTrue(foodRow?["unit"] is NSNull)
+        XCTAssertTrue(foodRow?["parentId"] is NSNull)
+        let meta = foodRow?["metadata"] as? [String: Any]
+        XCTAssertEqual(meta?["title"] as? String, "Kurczak z ryżem")
+        XCTAssertEqual(meta?["mealType"] as? String, "obiad")
+        XCTAssertNil(meta?[HKMetadataKeyFoodType])
+
+        let energyRow = list.first { $0["id"] as? String == energy.uuid.uuidString }
+        XCTAssertEqual(energyRow?["parentId"] as? String, food.uuid.uuidString)
+        XCTAssertEqual(energyRow?["type"] as? String, HKQuantityTypeIdentifier.dietaryEnergyConsumed.rawValue)
+        XCTAssertEqual(energyRow?["unit"] as? String, "Cal")
+
+        let proteinRow = list.first { $0["id"] as? String == protein.uuid.uuidString }
+        XCTAssertEqual(proteinRow?["parentId"] as? String, food.uuid.uuidString)
+
+        let caffeineRow = list.first { $0["id"] as? String == caffeine.uuid.uuidString }
+        XCTAssertTrue(caffeineRow?["parentId"] is NSNull)
+        XCTAssertEqual(caffeineRow?["unit"] as? String, "mg")
+
+        // The standalone energy sample is the same UUID as the food child — emit once.
+        XCTAssertEqual(list.filter { $0["id"] as? String == energy.uuid.uuidString }.count, 1)
+    }
+
+    func testRestoredTypesStillQueryFoodCorrelation() {
+        // configure() restores tracked types from the raw values saved by requestAuthorization.
+        let restored = OpenWearablesHealthSDK.shared.mapTypesFromStrings(["dietaryProtein", "steps"])
+        XCTAssertTrue(restored.contains { $0.identifier == HKCorrelationTypeIdentifier.food.rawValue })
+        XCTAssertTrue(restored.contains { $0.identifier == HKQuantityTypeIdentifier.dietaryProtein.rawValue })
+    }
+
+    func testDietarySampleOfFoodFromAnotherRoundIsNotSentLoose() {
+        let start = Date(timeIntervalSince1970: 1_779_163_200)
+        let protein = HKQuantitySample(
+            type: HKQuantityType.quantityType(forIdentifier: .dietaryProtein)!,
+            quantity: HKQuantity(unit: .gram(), doubleValue: 38.2),
+            start: start,
+            end: start
+        )
+        let caffeine = HKQuantitySample(
+            type: HKQuantityType.quantityType(forIdentifier: .dietaryCaffeine)!,
+            quantity: HKQuantity(unit: HKUnit.gramUnit(with: .milli), doubleValue: 95),
+            start: start,
+            end: start
+        )
+
+        // Protein belongs to a food correlation that the food query sends in another round.
+        let payload = OpenWearablesHealthSDK.shared.buildCombinedPayload(
+            samples: [protein, caffeine],
+            knownFoodChildIds: [protein.uuid]
+        )
+        let list = (payload["data"] as? [String: Any])?["records"] as? [[String: Any]] ?? []
+
+        XCTAssertFalse(list.contains { $0["id"] as? String == protein.uuid.uuidString })
+        let caffeineRow = list.first { $0["id"] as? String == caffeine.uuid.uuidString }
+        XCTAssertNotNil(caffeineRow)
+        XCTAssertTrue(caffeineRow?["parentId"] is NSNull)
+    }
+
     func testCyclingTypesMapToHealthKit() {
         XCTAssertEqual(HealthDataType.cyclingPower.rawValue, "cyclingPower")
         XCTAssertEqual(HealthDataType.cyclingCadence.rawValue, "cyclingCadence")
@@ -126,6 +291,81 @@ final class OpenWearablesHealthSDKTests: XCTestCase {
                 HKQuantityTypeIdentifier.cyclingFunctionalThresholdPower.rawValue
             )
         }
+    }
+
+    func testHeartRateVariabilityRMSSDMapsToHealthKit() {
+        XCTAssertEqual(HealthDataType.heartRateVariabilityRMSSD.rawValue, "heartRateVariabilityRMSSD")
+
+        #if compiler(>=6.4)
+        if #available(iOS 27.0, *) {
+            XCTAssertEqual(
+                HealthDataType.heartRateVariabilityRMSSD.toHKSampleType()?.identifier,
+                HKQuantityTypeIdentifier.heartRateVariabilityRMSSD.rawValue
+            )
+        } else {
+            XCTAssertNil(HealthDataType.heartRateVariabilityRMSSD.toHKSampleType())
+        }
+        #else
+        XCTAssertNil(HealthDataType.heartRateVariabilityRMSSD.toHKSampleType())
+        #endif
+    }
+
+    func testAppleSleepingWristTemperatureMapsToHealthKit() {
+        XCTAssertEqual(
+            HealthDataType.appleSleepingWristTemperature.rawValue,
+            "appleSleepingWristTemperature"
+        )
+
+        if #available(iOS 16.0, *) {
+            XCTAssertEqual(
+                HealthDataType.appleSleepingWristTemperature.toHKSampleType()?.identifier,
+                HKQuantityTypeIdentifier.appleSleepingWristTemperature.rawValue
+            )
+            // The overnight reading must not collapse into the manual thermometer type.
+            XCTAssertNotEqual(
+                HealthDataType.appleSleepingWristTemperature.toHKSampleType()?.identifier,
+                HKQuantityTypeIdentifier.bodyTemperature.rawValue
+            )
+        } else {
+            XCTAssertNil(HealthDataType.appleSleepingWristTemperature.toHKSampleType())
+        }
+    }
+
+    func testHeartRateRecoveryMapsToHealthKit() {
+        XCTAssertEqual(HealthDataType.heartRateRecoveryOneMinute.rawValue, "heartRateRecoveryOneMinute")
+
+        if #available(iOS 16.0, *) {
+            XCTAssertEqual(
+                HealthDataType.heartRateRecoveryOneMinute.toHKSampleType()?.identifier,
+                HKQuantityTypeIdentifier.heartRateRecoveryOneMinute.rawValue
+            )
+        }
+    }
+
+    func testHeartRateRecoverySampleIsSentInBpm() throws {
+        guard #available(iOS 16.0, *) else { throw XCTSkip("heartRateRecoveryOneMinute needs iOS 16") }
+        let type = HKQuantityType.quantityType(forIdentifier: .heartRateRecoveryOneMinute)!
+        let perMinute = HKUnit.count().unitDivided(by: .minute())
+        // HealthKit only accepts count/min for this type, so this is what Apple Watch writes.
+        XCTAssertTrue(type.is(compatibleWith: perMinute))
+        XCTAssertFalse(type.is(compatibleWith: .count()))
+
+        let start = Date(timeIntervalSince1970: 1_779_163_200)
+        let sample = HKQuantitySample(
+            type: type,
+            quantity: HKQuantity(unit: perMinute, doubleValue: 25),
+            start: start,
+            end: start
+        )
+
+        // Converting this sample to .count() used to throw NSInvalidArgumentException.
+        let payload = OpenWearablesHealthSDK.shared.buildCombinedPayload(samples: [sample])
+        let records = (payload["data"] as? [String: Any])?["records"] as? [[String: Any]] ?? []
+
+        XCTAssertEqual(records.count, 1)
+        XCTAssertEqual(records.first?["type"] as? String, HKQuantityTypeIdentifier.heartRateRecoveryOneMinute.rawValue)
+        XCTAssertEqual(records.first?["value"] as? Double, 25)
+        XCTAssertEqual(records.first?["unit"] as? String, "bpm")
     }
 
     func testRunningDynamicsTypesMapToHealthKit() {
@@ -205,6 +445,112 @@ final class OpenWearablesHealthSDKTests: XCTestCase {
         )
         let laps = OpenWearablesHealthSDK.shared._buildWorkoutLaps(workout, dateFormatter: ISO8601DateFormatter())
         XCTAssertTrue(laps is NSNull)
+    }
+
+    func testWorkoutRouteMapsLocationsInTimeOrder() {
+        let start = Date(timeIntervalSince1970: 1_700_000_000)
+        let second = CLLocation(
+            coordinate: CLLocationCoordinate2D(latitude: 52.229701, longitude: 21.012301),
+            altitude: 101.7, horizontalAccuracy: 4, verticalAccuracy: -1,
+            course: -1, speed: -1, timestamp: start.addingTimeInterval(1)
+        )
+        let first = CLLocation(
+            coordinate: CLLocationCoordinate2D(latitude: 52.229676, longitude: 21.012229),
+            altitude: 101.5, horizontalAccuracy: 3.5, verticalAccuracy: 2,
+            course: 90, speed: 2.9, timestamp: start
+        )
+        let invalid = CLLocation(
+            coordinate: CLLocationCoordinate2D(latitude: 0, longitude: 0),
+            altitude: 0, horizontalAccuracy: -1, verticalAccuracy: -1,
+            timestamp: start.addingTimeInterval(2)
+        )
+
+        let df = ISO8601DateFormatter()
+        let route = OpenWearablesHealthSDK.shared._buildWorkoutRoute([second, invalid, first], dateFormatter: df)
+
+        guard let points = route as? [[String: Any]] else {
+            XCTFail("Expected route array, got \(route)")
+            return
+        }
+        XCTAssertEqual(points.count, 2)
+        XCTAssertEqual(points[0]["timestamp"] as? String, df.string(from: start))
+        XCTAssertEqual(points[0]["latitude"] as? Double, 52.229676)
+        XCTAssertEqual(points[0]["longitude"] as? Double, 21.012229)
+        XCTAssertEqual(points[0]["altitudeM"] as? Double, 101.5)
+        XCTAssertEqual(points[0]["horizontalAccuracyM"] as? Double, 3.5)
+        XCTAssertEqual(points[0]["verticalAccuracyM"] as? Double, 2)
+        XCTAssertEqual(points[0]["speedMps"] as? Double, 2.9)
+        XCTAssertEqual(points[0]["courseDeg"] as? Double, 90)
+        // Invalid altitude, speed and course are null rather than CoreLocation's -1.
+        XCTAssertTrue(points[1]["altitudeM"] is NSNull)
+        XCTAssertTrue(points[1]["verticalAccuracyM"] is NSNull)
+        XCTAssertTrue(points[1]["speedMps"] is NSNull)
+        XCTAssertTrue(points[1]["courseDeg"] is NSNull)
+    }
+
+    func testWorkoutWithoutRouteHasNullRoute() {
+        let df = ISO8601DateFormatter()
+        XCTAssertTrue(OpenWearablesHealthSDK.shared._buildWorkoutRoute(nil, dateFormatter: df) is NSNull)
+        XCTAssertTrue(OpenWearablesHealthSDK.shared._buildWorkoutRoute([], dateFormatter: df) is NSNull)
+    }
+
+    func testCombinedPayloadCarriesRouteOfItsWorkout() {
+        let start = Date(timeIntervalSince1970: 1_700_000_000)
+        let workout = HKWorkout(
+            activityType: .running,
+            start: start,
+            end: start.addingTimeInterval(60),
+            workoutEvents: nil,
+            totalEnergyBurned: nil,
+            totalDistance: nil,
+            metadata: nil
+        )
+        let location = CLLocation(
+            coordinate: CLLocationCoordinate2D(latitude: 52.2, longitude: 21.0),
+            altitude: 100, horizontalAccuracy: 5, verticalAccuracy: 3, timestamp: start
+        )
+        let sdk = OpenWearablesHealthSDK.shared
+
+        let withRoute = sdk.buildCombinedPayload(samples: [workout], workoutRoutes: [workout.uuid: [location]])
+        let withoutRoute = sdk.buildCombinedPayload(samples: [workout])
+
+        let routed = ((withRoute["data"] as? [String: Any])?["workouts"] as? [[String: Any]])?.first
+        let plain = ((withoutRoute["data"] as? [String: Any])?["workouts"] as? [[String: Any]])?.first
+        XCTAssertEqual((routed?["route"] as? [[String: Any]])?.count, 1)
+        XCTAssertTrue(plain?["route"] is NSNull)
+    }
+
+    func testWorkoutsPerRoundAreCappedOnlyWhileRoutesAreTracked() {
+        let sdk = OpenWearablesHealthSDK.shared
+        let previous = sdk.trackedTypes
+        defer { sdk.trackedTypes = previous }
+        let workoutType = HKObjectType.workoutType()
+        let heartRate = HKObjectType.quantityType(forIdentifier: .heartRate)!
+        let cap = OpenWearablesHealthSDK.workoutsPerRoundWithRoutes
+
+        sdk.trackedTypes = sdk.mapTypes([.workout, .workoutRoute, .heartRate])
+        XCTAssertEqual(sdk.roundChunkLimit(for: workoutType, perTypeLimit: 666), cap)
+        XCTAssertEqual(sdk.roundChunkLimit(for: workoutType, perTypeLimit: 1), 1)
+        XCTAssertEqual(sdk.roundChunkLimit(for: heartRate, perTypeLimit: 666), 666)
+
+        sdk.trackedTypes = sdk.mapTypes([.workout, .heartRate])
+        XCTAssertEqual(sdk.roundChunkLimit(for: workoutType, perTypeLimit: 666), 666)
+    }
+
+    func testWorkoutRouteIsAuthorizedButNotQueriedAsRecords() {
+        let sdk = OpenWearablesHealthSDK.shared
+        let previous = sdk.trackedTypes
+        defer { sdk.trackedTypes = previous }
+        let routeIdentifier = HKSeriesType.workoutRoute().identifier
+
+        XCTAssertEqual(HealthDataType.workoutRoute.toHKSampleType()?.identifier, routeIdentifier)
+
+        sdk.trackedTypes = sdk.mapTypes([.workout, .workoutRoute])
+        XCTAssertTrue(sdk.typesForAuthorization().contains { $0.identifier == routeIdentifier })
+        XCTAssertFalse(sdk.getQueryableTypes().contains { $0.identifier == routeIdentifier })
+
+        sdk.trackedTypes = sdk.mapTypes([.workout])
+        XCTAssertFalse(sdk.typesForAuthorization().contains { $0.identifier == routeIdentifier })
     }
 
     func testInvalidPersistedRefreshURLDoesNotFallBackToSyncHost() {
