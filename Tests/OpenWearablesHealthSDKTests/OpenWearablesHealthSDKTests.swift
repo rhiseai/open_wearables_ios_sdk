@@ -147,6 +147,25 @@ final class OpenWearablesHealthSDKTests: XCTestCase {
         XCTAssertTrue(sdk.getQueryableTypes().contains { $0.identifier == HKCorrelationTypeIdentifier.food.rawValue })
     }
 
+    /// The React Native bridge's authorization probe (Rhise fork) asks about the types an app
+    /// passes without tracking them, and must get the set `requestAuthorization` would read.
+    func testAuthorizationTypesOfRequestedTypesMatchWhatTrackingThemAuthorizes() {
+        let sdk = OpenWearablesHealthSDK.shared
+        let previous = sdk.trackedTypes
+        defer { sdk.trackedTypes = previous }
+        let requested = sdk.mapTypes([.dietaryProtein, .bloodPressure, .workout, .workoutRoute])
+
+        sdk.trackedTypes = []
+        let probed = sdk.typesForAuthorization(of: requested).map(\.identifier)
+        XCTAssertTrue(sdk.trackedTypes.isEmpty, "asking must not track the types")
+
+        sdk.trackedTypes = requested
+        XCTAssertEqual(probed, sdk.typesForAuthorization().map(\.identifier))
+        XCTAssertFalse(probed.contains(HKCorrelationTypeIdentifier.food.rawValue))
+        XCTAssertFalse(probed.contains(HKCorrelationTypeIdentifier.bloodPressure.rawValue))
+        XCTAssertTrue(probed.contains(HKSeriesType.workoutRoute().identifier))
+    }
+
     func testFoodCorrelationEmitsParentAndChildrenInRecords() {
         let start = Date(timeIntervalSince1970: 1_779_163_200) // 2026-05-18-ish just a fixed date
         let energyType = HKQuantityType.quantityType(forIdentifier: .dietaryEnergyConsumed)!

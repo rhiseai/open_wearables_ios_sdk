@@ -963,6 +963,12 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
     }
     
     internal func getQueryableTypes() -> [HKSampleType] {
+        queryableTypes(of: trackedTypes)
+    }
+
+    /// `getQueryableTypes()` for any set of tracked types (Rhise fork, for
+    /// `typesForAuthorization(of:)`).
+    internal func queryableTypes(of tracked: [HKSampleType]) -> [HKSampleType] {
         // Blood pressure is synced from the systolic and diastolic samples.
         // Food stays here: the correlation is queried for the parent meal, but
         // HealthKit refuses it in requestAuthorization (see typesForAuthorization).
@@ -972,7 +978,7 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
             HKSeriesType.workoutRoute().identifier
         ]
         
-        return trackedTypes.filter { type in
+        return tracked.filter { type in
             !disallowedIdentifiers.contains(type.identifier)
         }
     }
@@ -985,9 +991,16 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
     /// food correlation comes from the dietary quantity types it contains.
     /// The workout route type is not queried on its own but still needs read access.
     internal func typesForAuthorization() -> [HKSampleType] {
-        getQueryableTypes().filter { type in
+        typesForAuthorization(of: trackedTypes)
+    }
+
+    /// `typesForAuthorization()` for any set of tracked types, without tracking them (Rhise
+    /// fork). The React Native bridge's authorization probe asks HealthKit about this set, so
+    /// it asks about exactly what `requestAuthorization(types:)` requests for the same types.
+    internal func typesForAuthorization(of tracked: [HKSampleType]) -> [HKSampleType] {
+        queryableTypes(of: tracked).filter { type in
             type.identifier != HKCorrelationTypeIdentifier.food.rawValue
-        } + trackedTypes.filter { $0.identifier == HKSeriesType.workoutRoute().identifier }
+        } + tracked.filter { $0.identifier == HKSeriesType.workoutRoute().identifier }
     }
 
     // MARK: - Internal: Sync
