@@ -786,26 +786,54 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
                 completion(true)
                 return
             }
-            let chunks = stride(from: 0, to: collected.count, by: self.recordsPerChunk).map {
-                Array(collected[$0..<min($0 + self.recordsPerChunk, collected.count)])
-            }
-            self.uploadRecentWindowChunks(
-                chunks,
-                index: 0,
+            self.uploadRecentWindow(
+                collected,
                 endpoint: endpoint,
                 credential: credential,
                 generation: generation
             ) { ok in
                 self.finishSync(generation: generation)
-                self.logMessage("syncRecentWindow: processed \(collected.count) samples in \(chunks.count) chunk(s) (ok=\(ok))")
+                self.logMessage("syncRecentWindow: processed \(collected.count) samples (ok=\(ok))")
                 completion(ok)
             }
+        }
+    }
+
+    /// Uploads the samples `syncRecentWindow` re-read, `recordsPerChunk` at a time.
+    ///
+    /// Chunks are cut by count, so a food correlation and its nutrients can land in different
+    /// chunks. Every chunk is built knowing the children of every food in the window, and of
+    /// the foods HealthKit holds around its loose dietary samples, so a nutrient goes out once,
+    /// under its food, as in a sync round.
+    internal func uploadRecentWindow(
+        _ samples: [HKSample],
+        endpoint: URL,
+        credential: String,
+        generation: Int,
+        completion: @escaping (Bool) -> Void
+    ) {
+        fetchFoodChildIds(forLooseDietaryIn: samples) { [weak self] childIdsOfFoodsAround in
+            guard let self = self else { completion(false); return }
+            let knownFoodChildIds = self._foodChildIds(in: samples).union(childIdsOfFoodsAround)
+            let chunks = stride(from: 0, to: samples.count, by: self.recordsPerChunk).map {
+                Array(samples[$0..<min($0 + self.recordsPerChunk, samples.count)])
+            }
+            self.uploadRecentWindowChunks(
+                chunks,
+                index: 0,
+                knownFoodChildIds: knownFoodChildIds,
+                endpoint: endpoint,
+                credential: credential,
+                generation: generation,
+                completion: completion
+            )
         }
     }
 
     private func uploadRecentWindowChunks(
         _ chunks: [[HKSample]],
         index: Int,
+        knownFoodChildIds: Set<UUID>,
         endpoint: URL,
         credential: String,
         generation: Int,
@@ -819,11 +847,16 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
             completion(true)
             return
         }
+        let syncContext = SyncRequestContext(
+            inBackground: backgroundTimeRemainingIfInBackground() != nil,
+            trigger: .recentWindow
+        )
         uploadCombinedPayload(
-            payload: buildCombinedPayload(samples: chunks[index]),
+            payload: buildCombinedPayload(samples: chunks[index], knownFoodChildIds: knownFoodChildIds),
             endpoint: endpoint,
             credential: credential,
-            generation: generation
+            generation: generation,
+            syncContext: syncContext
         ) { [weak self] success in
             guard let self = self, success else {
                 completion(false)
@@ -832,6 +865,7 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
             self.uploadRecentWindowChunks(
                 chunks,
                 index: index + 1,
+                knownFoodChildIds: knownFoodChildIds,
                 endpoint: endpoint,
                 credential: credential,
                 generation: generation,

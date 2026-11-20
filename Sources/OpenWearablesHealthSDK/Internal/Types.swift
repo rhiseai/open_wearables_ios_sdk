@@ -820,7 +820,7 @@ extension OpenWearablesHealthSDK {
     
     // MARK: - Memory-efficient mappers
     
-    private func _foodChildIds(in samples: [HKSample]) -> Set<UUID> {
+    internal func _foodChildIds(in samples: [HKSample]) -> Set<UUID> {
         var ids = Set<UUID>()
         for sample in samples {
             guard let corr = sample as? HKCorrelation,
@@ -1283,6 +1283,8 @@ internal enum SyncTrigger: String {
     case network
     /// `syncNow()` called by the app (Rhise fork).
     case syncNow = "sync_now"
+    /// `syncRecentWindow()` called by the app (Rhise fork).
+    case recentWindow = "recent_window"
 }
 
 /// Sync attribution sent as headers on an upload. Captured when the batch is built,
