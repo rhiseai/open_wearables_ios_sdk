@@ -42,7 +42,10 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
     /// Shared singleton instance.
     public static let shared = OpenWearablesHealthSDK()
     
-    internal static let sdkVersion = "0.16.0"
+    /// Sent as the payload's `sdkVersion`. Open Wearables reads percentages as a 0-1 fraction
+    /// from any iOS SDK older than 0.17.0 and multiplies them by 100, so this stays at 0.17.0 or
+    /// higher while the SDK sends them on a 0-100 scale.
+    internal static let sdkVersion = "0.17.0"
     
     // MARK: - Public Callbacks
     

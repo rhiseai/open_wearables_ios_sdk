@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+* **Rhise fork version 0.17.0**: the payload's `sdkVersion`, the `X-Open-Wearables-SDK-Version` header and the podspec say `0.17.0`. Open Wearables (`APPLE_SDK_PERCENT_SCALE_MIN_VERSION`) multiplies percentages by 100 for any iOS SDK older than 0.17.0, and upstream `master` already sends them on a 0-100 scale while it still says `0.16.0`, which would store body fat `30.4` as `3040` on every backend version.
 * **Rhise fork health types**: authorize and sync `basalBodyTemperature` in `degC`. The fork's `dietaryFiber`, `dietarySugar` and `dietaryCaffeine` are now the upstream cases from 0.16.0, with the same raw values, HealthKit identifiers and units.
 * **Rhise foreground sync API**: `syncNow(completion:)` starts a fresh anchor-based round after the initial export while preserving an unfinished full export. Its uploads carry `X-Open-Wearables-Sync-Trigger: sync_now`.
 * **Rhise terminal-failure guard**: stable 4xx payload rejections pause automatic and recent-window sync until the host clears the session.

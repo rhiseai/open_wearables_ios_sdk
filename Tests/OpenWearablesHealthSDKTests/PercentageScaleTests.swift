@@ -32,4 +32,18 @@ final class PercentageScaleTests: XCTestCase {
             XCTAssertEqual(r?["value"] as? Double ?? .nan, expected, accuracy: 1e-9, identifier.rawValue)
         }
     }
+
+    /// Open Wearables multiplies percentages by 100 again for any iOS SDK older than 0.17.0
+    /// (`APPLE_SDK_PERCENT_SCALE_MIN_VERSION`), so a payload on the 0-100 scale must declare
+    /// at least that version, as plain numbers the backend's version parser reads.
+    func testPayloadDeclaresAVersionTheBackendReadsAsTheNewScale() {
+        let payload = OpenWearablesHealthSDK.shared.buildCombinedPayload(samples: [])
+        let version = payload["sdkVersion"] as? String ?? ""
+        let parts = version.split(separator: ".").map { Int($0) }
+
+        XCTAssertEqual(parts.count, 3, "sdkVersion \(version) is not major.minor.patch")
+        XCTAssertFalse(parts.contains(nil), "sdkVersion \(version) has a non-numeric part")
+        let numbers = parts.compactMap { $0 }
+        XCTAssertFalse(numbers.lexicographicallyPrecedes([0, 17, 0]), "sdkVersion \(version) is older than 0.17.0")
+    }
 }
