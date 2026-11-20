@@ -799,12 +799,8 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         }
     }
 
-    /// Uploads the samples `syncRecentWindow` re-read, `recordsPerChunk` at a time.
-    ///
-    /// Chunks are cut by count, so a food correlation and its nutrients can land in different
-    /// chunks. Every chunk is built knowing the children of every food in the window, and of
-    /// the foods HealthKit holds around its loose dietary samples, so a nutrient goes out once,
-    /// under its food, as in a sync round.
+    /// Uploads the samples `syncRecentWindow` re-read, with the foods HealthKit holds around
+    /// their loose dietary samples.
     internal func uploadRecentWindow(
         _ samples: [HKSample],
         endpoint: URL,
@@ -812,22 +808,52 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         generation: Int,
         completion: @escaping (Bool) -> Void
     ) {
-        fetchFoodChildIds(forLooseDietaryIn: samples) { [weak self] childIdsOfFoodsAround in
+        fetchFoodParents(forLooseDietaryIn: samples) { [weak self] foodsAround in
             guard let self = self else { completion(false); return }
-            let knownFoodChildIds = self._foodChildIds(in: samples).union(childIdsOfFoodsAround)
-            let chunks = stride(from: 0, to: samples.count, by: self.recordsPerChunk).map {
-                Array(samples[$0..<min($0 + self.recordsPerChunk, samples.count)])
-            }
-            self.uploadRecentWindowChunks(
-                chunks,
-                index: 0,
-                knownFoodChildIds: knownFoodChildIds,
+            self.uploadRecentWindow(
+                samples,
+                foodsAround: foodsAround,
                 endpoint: endpoint,
                 credential: credential,
                 generation: generation,
                 completion: completion
             )
         }
+    }
+
+    /// Uploads `samples`, `recordsPerChunk` at a time, so that every nutrient goes out once,
+    /// under its food when it has one, as in a sync round.
+    ///
+    /// A food can start before the window while a nutrient of it is inside. No later round
+    /// re-sends a window, so that food goes out with the window instead of the nutrient being
+    /// left to it. Chunks are cut by count, so a food and its nutrients can land in different
+    /// chunks: every chunk is built knowing the children of every food in the upload.
+    internal func uploadRecentWindow(
+        _ samples: [HKSample],
+        foodsAround: [HKCorrelation],
+        endpoint: URL,
+        credential: String,
+        generation: Int,
+        completion: @escaping (Bool) -> Void
+    ) {
+        let inWindow = Set(samples.map { $0.uuid })
+        let foodsStartingOutside = foodsAround.filter { food in
+            !inWindow.contains(food.uuid) && food.objects.contains { inWindow.contains($0.uuid) }
+        }
+        let upload = samples + foodsStartingOutside
+        let knownFoodChildIds = _foodChildIds(in: upload)
+        let chunks = stride(from: 0, to: upload.count, by: recordsPerChunk).map {
+            Array(upload[$0..<min($0 + recordsPerChunk, upload.count)])
+        }
+        uploadRecentWindowChunks(
+            chunks,
+            index: 0,
+            knownFoodChildIds: knownFoodChildIds,
+            endpoint: endpoint,
+            credential: credential,
+            generation: generation,
+            completion: completion
+        )
     }
 
     private func uploadRecentWindowChunks(
@@ -1463,6 +1489,19 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         forLooseDietaryIn samples: [HKSample],
         completion: @escaping (Set<UUID>) -> Void
     ) {
+        fetchFoodParents(forLooseDietaryIn: samples) { parents in
+            completion(Set(parents.flatMap { $0.objects.map { $0.uuid } }))
+        }
+    }
+
+    /// The food correlations HealthKit holds around the loose dietary samples in `samples`:
+    /// the lookup behind `fetchFoodChildIds`, which `uploadRecentWindow` (Rhise fork) needs
+    /// whole, to send a food that starts outside its window. Empty when there is nothing to
+    /// check or the lookup fails.
+    private func fetchFoodParents(
+        forLooseDietaryIn samples: [HKSample],
+        completion: @escaping ([HKCorrelation]) -> Void
+    ) {
         // Without the food type tracked, nothing else would ever send these samples.
         guard let foodType = HKObjectType.correlationType(forIdentifier: .food),
               trackedTypes.contains(where: { $0.identifier == foodType.identifier }) else {
@@ -1495,13 +1534,7 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
                 completion([])
                 return
             }
-            var ids = Set<UUID>()
-            for correlation in correlations ?? [] {
-                for object in correlation.objects {
-                    ids.insert(object.uuid)
-                }
-            }
-            completion(ids)
+            completion(correlations ?? [])
         }
         healthStore.execute(query)
     }
