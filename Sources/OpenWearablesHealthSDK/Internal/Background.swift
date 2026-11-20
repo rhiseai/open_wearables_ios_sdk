@@ -87,6 +87,7 @@ extension OpenWearablesHealthSDK {
         scheduleAppRefresh()
         runBackgroundSync(
             label: "BGAppRefresh",
+            trigger: .appRefresh,
             retryOutbox: false,
             setExpirationHandler: { task.expirationHandler = $0 },
             complete: { task.setTaskCompleted(success: $0) }
@@ -98,6 +99,7 @@ extension OpenWearablesHealthSDK {
         scheduleProcessing()
         runBackgroundSync(
             label: "BGProcessing",
+            trigger: .processing,
             retryOutbox: true,
             setExpirationHandler: { task.expirationHandler = $0 },
             complete: { task.setTaskCompleted(success: $0) }
@@ -115,6 +117,7 @@ extension OpenWearablesHealthSDK {
     /// exactly once, from the run or from the expiration handler.
     internal func runBackgroundSync(
         label: String,
+        trigger: SyncTrigger,
         retryOutbox: Bool,
         setExpirationHandler: (@escaping () -> Void) -> Void,
         complete: @escaping (Bool) -> Void
@@ -127,7 +130,7 @@ extension OpenWearablesHealthSDK {
         }
 
         if retryOutbox { retryOutboxIfPossible() }
-        collectAllData(fullExport: false, isBackground: true) {
+        collectAllData(fullExport: false, isBackground: true, trigger: trigger) {
             completion.finish(success: true)
         }
     }
