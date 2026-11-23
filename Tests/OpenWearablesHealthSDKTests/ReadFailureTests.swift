@@ -7,29 +7,30 @@ import XCTest
 /// the anchor capture for good. A locked device still pauses and retries (RHISE-8003).
 final class ReadFailureTests: XCTestCase {
 
-    func testOnlyALockedDeviceIsWorthRetryingARead() {
+    func testOnlyErrorsNoRetryFixesMakeATypeUnreadable() {
         let sdk = OpenWearablesHealthSDK.shared
-        let notDetermined = NSError(
-            domain: "com.apple.healthkit", code: 5,
-            userInfo: [NSLocalizedDescriptionKey: "Authorization not determined"]
-        )
-        let databaseInaccessible = NSError(
-            domain: "com.apple.healthkit", code: 6,
-            userInfo: [NSLocalizedDescriptionKey: "Protected health data is inaccessible"]
-        )
-        let lockedByMessage = NSError(
-            domain: "com.apple.healthkit", code: 0,
-            userInfo: [NSLocalizedDescriptionKey: "Protected health data is inaccessible"]
-        )
-        let invalidArgument = NSError(
-            domain: "com.apple.healthkit", code: 3,
-            userInfo: [NSLocalizedDescriptionKey: "Invalid argument"]
+        func healthKitError(_ code: HKError.Code, _ message: String) -> NSError {
+            NSError(domain: HKErrorDomain, code: code.rawValue, userInfo: [NSLocalizedDescriptionKey: message])
+        }
+
+        XCTAssertEqual(sdk.readFailure(of: healthKitError(.errorAuthorizationNotDetermined, "Authorization not determined")), .unreadable)
+        XCTAssertEqual(sdk.readFailure(of: healthKitError(.errorAuthorizationDenied, "Authorization denied")), .unreadable)
+        XCTAssertEqual(sdk.readFailure(of: healthKitError(.errorHealthDataUnavailable, "Health data unavailable")), .unreadable)
+        XCTAssertEqual(sdk.readFailure(of: healthKitError(.errorInvalidArgument, "Invalid argument")), .unreadable)
+
+        XCTAssertEqual(sdk.readFailure(of: healthKitError(.errorDatabaseInaccessible, "Protected health data is inaccessible")), .retryAfterUnlock)
+        XCTAssertEqual(
+            sdk.readFailure(of: NSError(domain: HKErrorDomain, code: 0, userInfo: [NSLocalizedDescriptionKey: "Protected health data is inaccessible"])),
+            .retryAfterUnlock
         )
 
-        XCTAssertEqual(sdk.readFailure(of: notDetermined), .unreadable)
-        XCTAssertEqual(sdk.readFailure(of: invalidArgument), .unreadable)
-        XCTAssertEqual(sdk.readFailure(of: databaseInaccessible), .retryAfterUnlock)
-        XCTAssertEqual(sdk.readFailure(of: lockedByMessage), .retryAfterUnlock)
+        // A failure nothing says is permanent may pass on the next run, so it must not
+        // let a replay report success or end a type's export.
+        XCTAssertEqual(sdk.readFailure(of: NSError(domain: HKErrorDomain, code: 0, userInfo: [NSLocalizedDescriptionKey: "Unknown error"])), .retryLater)
+        XCTAssertEqual(
+            sdk.readFailure(of: NSError(domain: NSCocoaErrorDomain, code: NSXPCConnectionInterrupted, userInfo: [NSLocalizedDescriptionKey: "Couldn't communicate with a helper application."])),
+            .retryLater
+        )
     }
 
     /// The production failure: every type with data was sent and anchored, one tracked

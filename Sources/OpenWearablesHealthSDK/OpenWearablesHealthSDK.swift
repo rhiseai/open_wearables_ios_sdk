@@ -747,10 +747,10 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
             ) { [weak self] _, samples, error in
                 if let error = error {
                     self?.logMessage("syncRecentWindow: \(self?.shortTypeName(type.identifier) ?? type.identifier) error: \(error.localizedDescription)")
-                    // A locked device fails the replay, so the host keeps its window and
-                    // replays it after unlock. A type HealthKit cannot read contributes
-                    // nothing, as it does to the export, instead of failing the replay of
-                    // every other type on every app open.
+                    // A type HealthKit cannot read contributes nothing, as it does to the
+                    // export, instead of failing the replay of every other type on every
+                    // app open. Any other failure fails the replay, so the host keeps its
+                    // window and replays it.
                     if self?.readFailure(of: error) != .unreadable {
                         collectLock.lock()
                         queryFailed = true
@@ -1514,6 +1514,11 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
                     case .unreadable:
                         self.logMessage("\(self.shortTypeName(type.identifier)): \(error.localizedDescription) - skipping")
                         completion(true, [], nil, true)
+                    case .retryLater:
+                        // Not "done": the export would mark the type complete with the rest
+                        // of its history unread. The cursor stays, the next run retries.
+                        self.logMessage("\(self.shortTypeName(type.identifier)): \(error.localizedDescription) - pausing sync")
+                        completion(false, [], nil, false)
                     }
                     return
                 }
@@ -1559,7 +1564,9 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
                         self.logMessage("\(self.shortTypeName(type.identifier)): protected data inaccessible - pausing sync")
                         self.pendingSyncAfterUnlock = true
                         completion(false, [], nil, nil, false)
-                    case .unreadable:
+                    case .unreadable, .retryLater:
+                        // Skipping returns no anchor, so the saved one stays and the next run
+                        // reads this type again; pausing would hold back every other type.
                         self.logMessage("\(self.shortTypeName(type.identifier)): \(error.localizedDescription) - skipping")
                         completion(true, [], nil, nil, true)
                     }
@@ -1619,6 +1626,9 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
                 case .unreadable:
                     self.logMessage("\(self.shortTypeName(type.identifier)): anchor capture failed - \(error.localizedDescription)")
                     completion(.unreadable)
+                case .retryLater:
+                    self.logMessage("\(self.shortTypeName(type.identifier)): anchor capture failed - \(error.localizedDescription)")
+                    completion(.retryLater)
                 }
                 return
             }
@@ -2213,8 +2223,33 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
     /// one function: the full-export crawl, the incremental crawl, the anchor capture
     /// after an export and the recent-window replay.
     internal func readFailure(of error: Error) -> HealthKitReadFailure {
-        isProtectedDataError(error) ? .retryAfterUnlock : .unreadable
+        if isProtectedDataError(error) {
+            return .retryAfterUnlock
+        }
+        let nsError = error as NSError
+        if nsError.domain == HKErrorDomain && Self.unreadableTypeErrorCodes.contains(nsError.code) {
+            return .unreadable
+        }
+        return .retryLater
     }
+
+    /// HealthKit errors that no retry fixes: authorization the user has not given (or
+    /// was never asked for), HealthKit unavailable or restricted on this device, a guest
+    /// user, or a query HealthKit rejects as invalid.
+    private static let unreadableTypeErrorCodes: Set<Int> = {
+        var codes: Set<Int> = [
+            HKError.Code.errorHealthDataUnavailable.rawValue,
+            HKError.Code.errorHealthDataRestricted.rawValue,
+            HKError.Code.errorInvalidArgument.rawValue,
+            HKError.Code.errorAuthorizationDenied.rawValue,
+            HKError.Code.errorAuthorizationNotDetermined.rawValue,
+            HKError.Code.errorRequiredAuthorizationDenied.rawValue,
+        ]
+        if #available(iOS 18.0, *) {
+            codes.insert(HKError.Code.errorNotPermissibleForGuestUserMode.rawValue)
+        }
+        return codes
+    }()
     
     // MARK: - Helpers
     
