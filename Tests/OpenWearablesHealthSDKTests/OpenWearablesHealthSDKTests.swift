@@ -247,6 +247,56 @@ final class OpenWearablesHealthSDKTests: XCTestCase {
         XCTAssertTrue(caffeineRow?["parentId"] is NSNull)
     }
 
+    func testRecentWindowSendsAFoodChildOnlyWithItsFoodAcrossChunks() {
+        let sdk = OpenWearablesHealthSDK.shared
+        let previousChunkSize = sdk.recordsPerChunk
+        defer { sdk.recordsPerChunk = previousChunkSize }
+        sdk.recordsPerChunk = 2
+
+        let start = Date(timeIntervalSince1970: 1_779_163_200)
+        func sample(_ id: HKQuantityTypeIdentifier, _ unit: HKUnit, _ value: Double) -> HKQuantitySample {
+            HKQuantitySample(
+                type: HKQuantityType.quantityType(forIdentifier: id)!,
+                quantity: HKQuantity(unit: unit, doubleValue: value),
+                start: start,
+                end: start
+            )
+        }
+        let energy = sample(.dietaryEnergyConsumed, .kilocalorie(), 550)
+        let food = HKCorrelation(
+            type: HKObjectType.correlationType(forIdentifier: .food)!,
+            start: start,
+            end: start,
+            objects: [energy],
+            metadata: nil
+        )
+        let steps = sample(.stepCount, .count(), 120)
+        let caffeine = sample(.dietaryCaffeine, HKUnit.gramUnit(with: .milli), 95)
+        // Belongs to a food outside the window, found by `fetchFoodChildIds`.
+        let protein = sample(.dietaryProtein, .gram(), 38.2)
+
+        // The replay reads each type on its own, so the food lands in the first chunk
+        // and its energy child in the second.
+        let window = sdk.recentWindowChunks(
+            [food, steps, energy, caffeine, protein],
+            lookedUpFoodChildIds: [protein.uuid]
+        )
+        XCTAssertEqual(window.chunks.count, 3)
+
+        let rows = window.chunks.flatMap { chunk -> [[String: Any]] in
+            let payload = sdk.buildCombinedPayload(samples: chunk, knownFoodChildIds: window.foodChildIds)
+            return (payload["data"] as? [String: Any])?["records"] as? [[String: Any]] ?? []
+        }
+        let energyRows = rows.filter { $0["id"] as? String == energy.uuid.uuidString }
+        XCTAssertEqual(energyRows.count, 1)
+        XCTAssertEqual(energyRows.first?["parentId"] as? String, food.uuid.uuidString)
+        XCTAssertFalse(rows.contains { $0["id"] as? String == protein.uuid.uuidString })
+        let caffeineRow = rows.first { $0["id"] as? String == caffeine.uuid.uuidString }
+        XCTAssertNotNil(caffeineRow)
+        XCTAssertTrue(caffeineRow?["parentId"] is NSNull)
+        XCTAssertNotNil(rows.first { $0["id"] as? String == steps.uuid.uuidString })
+    }
+
     func testCyclingTypesMapToHealthKit() {
         XCTAssertEqual(HealthDataType.cyclingPower.rawValue, "cyclingPower")
         XCTAssertEqual(HealthDataType.cyclingCadence.rawValue, "cyclingCadence")

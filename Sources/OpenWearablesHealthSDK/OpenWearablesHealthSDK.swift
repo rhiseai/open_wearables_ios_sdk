@@ -783,25 +783,47 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
                 completion(true)
                 return
             }
-            let chunks = stride(from: 0, to: collected.count, by: self.recordsPerChunk).map {
-                Array(collected[$0..<min($0 + self.recordsPerChunk, collected.count)])
-            }
-            self.uploadRecentWindowChunks(
-                chunks,
-                index: 0,
-                endpoint: endpoint,
-                credential: credential,
-                generation: generation
-            ) { ok in
-                self.finishSync(generation: generation)
-                self.logMessage("syncRecentWindow: processed \(collected.count) samples in \(chunks.count) chunk(s) (ok=\(ok))")
-                completion(ok)
+            self.fetchFoodChildIds(forLooseDietaryIn: collected) { [weak self] lookedUpFoodChildIds in
+                guard let self = self else { completion(false); return }
+                let window = self.recentWindowChunks(collected, lookedUpFoodChildIds: lookedUpFoodChildIds)
+                self.uploadRecentWindowChunks(
+                    window.chunks,
+                    foodChildIds: window.foodChildIds,
+                    index: 0,
+                    endpoint: endpoint,
+                    credential: credential,
+                    generation: generation
+                ) { ok in
+                    self.finishSync(generation: generation)
+                    self.logMessage("syncRecentWindow: processed \(collected.count) samples in \(window.chunks.count) chunk(s) (ok=\(ok))")
+                    completion(ok)
+                }
             }
         }
     }
 
+    /// Splits a recent-window replay into upload chunks, and names the dietary samples
+    /// every chunk leaves to their food row.
+    ///
+    /// The replay reads a food correlation and its dietary children as separate samples,
+    /// so a child can fall into another chunk than its food, or its food can sit outside
+    /// the window. Sent on its own it would go out loose (`parentId` null) next to the
+    /// food row, and the backend would store it twice, as a meal nutrient and as a time
+    /// series. The children of every food in the window, and those `fetchFoodChildIds`
+    /// found for foods around it, are therefore sent only by their food, as in a sync round.
+    internal func recentWindowChunks(
+        _ samples: [HKSample],
+        lookedUpFoodChildIds: Set<UUID>
+    ) -> (chunks: [[HKSample]], foodChildIds: Set<UUID>) {
+        let chunks = stride(from: 0, to: samples.count, by: recordsPerChunk).map {
+            Array(samples[$0..<min($0 + recordsPerChunk, samples.count)])
+        }
+        return (chunks, _foodChildIds(in: samples).union(lookedUpFoodChildIds))
+    }
+
     private func uploadRecentWindowChunks(
         _ chunks: [[HKSample]],
+        foodChildIds: Set<UUID>,
         index: Int,
         endpoint: URL,
         credential: String,
@@ -817,7 +839,7 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
             return
         }
         uploadCombinedPayload(
-            payload: buildCombinedPayload(samples: chunks[index]),
+            payload: buildCombinedPayload(samples: chunks[index], knownFoodChildIds: foodChildIds),
             endpoint: endpoint,
             credential: credential,
             generation: generation
@@ -828,6 +850,7 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
             }
             self.uploadRecentWindowChunks(
                 chunks,
+                foodChildIds: foodChildIds,
                 index: index + 1,
                 endpoint: endpoint,
                 credential: credential,

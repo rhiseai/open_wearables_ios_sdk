@@ -811,7 +811,7 @@ extension OpenWearablesHealthSDK {
     
     // MARK: - Memory-efficient mappers
     
-    private func _foodChildIds(in samples: [HKSample]) -> Set<UUID> {
+    internal func _foodChildIds(in samples: [HKSample]) -> Set<UUID> {
         var ids = Set<UUID>()
         for sample in samples {
             guard let corr = sample as? HKCorrelation,
