@@ -48,6 +48,7 @@ extension OpenWearablesHealthSDK {
         endpoint: URL,
         credential: String,
         generation: Int,
+        syncContext: SyncRequestContext? = nil,
         completion: @escaping (Bool) -> Void
     ) {
         guard let payloadData = try? JSONSerialization.data(withJSONObject: payload) else {
@@ -57,7 +58,7 @@ extension OpenWearablesHealthSDK {
         }
         
         let requestId = UUID().uuidString
-        var req = buildRequest(url: endpoint, credential: credential, requestId: requestId)
+        var req = buildRequest(url: endpoint, credential: credential, requestId: requestId, syncContext: syncContext)
         req.httpBody = payloadData
         
         self.logPayloadSummary(payloadData, label: "Sending")
@@ -101,6 +102,7 @@ extension OpenWearablesHealthSDK {
                     endpoint: endpoint,
                     requestId: requestId,
                     generation: generation,
+                    syncContext: syncContext,
                     completion: completion
                 )
                 return
@@ -129,6 +131,7 @@ extension OpenWearablesHealthSDK {
         endpoint: URL,
         requestId: String,
         generation: Int,
+        syncContext: SyncRequestContext?,
         completion: @escaping (Bool) -> Void
     ) {
         if isApiKeyAuth {
@@ -158,7 +161,9 @@ extension OpenWearablesHealthSDK {
                 self.logMessage("Token refreshed, retrying...")
                 
                 let retryKey = "\(requestId)#retry"
-                var retryReq = self.buildRequest(url: endpoint, credential: newCredential, requestId: requestId)
+                var retryReq = self.buildRequest(
+                    url: endpoint, credential: newCredential, requestId: requestId, syncContext: syncContext
+                )
                 retryReq.httpBody = payloadData
                 
                 let retryTask = self.foregroundSession.dataTask(with: retryReq) { [weak self] _, retryResponse, retryError in

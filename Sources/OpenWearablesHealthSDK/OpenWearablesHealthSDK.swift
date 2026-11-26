@@ -1,3 +1,4 @@
+import CoreLocation
 import Foundation
 import UIKit
 import HealthKit
@@ -41,7 +42,10 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
     /// Shared singleton instance.
     public static let shared = OpenWearablesHealthSDK()
     
-    internal static let sdkVersion = "0.15.0"
+    /// Sent as the payload's `sdkVersion`. Open Wearables reads percentages as a 0-1 fraction
+    /// from any iOS SDK older than 0.17.0 and multiplies them by 100, so this stays at 0.17.0 or
+    /// higher while the SDK sends them on a 0-100 scale.
+    internal static let sdkVersion = "0.17.0"
     
     // MARK: - Public Callbacks
     
@@ -135,7 +139,8 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         method: String = "POST",
         credential: String?,
         requestId: String,
-        outboxItemId: String? = nil
+        outboxItemId: String? = nil,
+        syncContext: SyncRequestContext? = nil
     ) -> URLRequest {
         var request = URLRequest(url: url)
         request.httpMethod = method
@@ -146,6 +151,10 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         request.setValue(requestId, forHTTPHeaderField: "X-Request-Id")
         if let outboxItemId = outboxItemId {
             request.setValue(outboxItemId, forHTTPHeaderField: "X-Open-Wearables-Outbox-Item")
+        }
+        if let syncContext = syncContext {
+            request.setValue(syncContext.appState, forHTTPHeaderField: "X-Open-Wearables-App-State")
+            request.setValue(syncContext.trigger.rawValue, forHTTPHeaderField: "X-Open-Wearables-Sync-Trigger")
         }
         if let credential = credential {
             applyAuth(to: &request, credential: credential)
@@ -636,7 +645,7 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
     /// keeps that export in full-export mode and resumes it instead. Concurrent
     /// calls are coalesced by the existing single-flight sync guard.
     public func syncNow(completion: @escaping () -> Void) {
-        syncAll(fullExport: false, completion: completion)
+        syncAll(fullExport: false, trigger: .syncNow, completion: completion)
     }
 
     /// Whether sync is currently active.
@@ -656,7 +665,7 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
             return
         }
         
-        syncAll(fullExport: false) {
+        syncAll(fullExport: false, trigger: .resume) {
             completion(true)
         }
     }
@@ -670,7 +679,7 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         
         if OpenWearablesHealthSdkKeychain.isSyncActive() && self.hasAuth {
             logMessage("Triggering full export after reset...")
-            self.syncAll(fullExport: true) {
+            self.syncAll(fullExport: true, trigger: .reset) {
                 self.logMessage("Full export after reset completed")
             }
         }
@@ -783,26 +792,80 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
                 completion(true)
                 return
             }
-            let chunks = stride(from: 0, to: collected.count, by: self.recordsPerChunk).map {
-                Array(collected[$0..<min($0 + self.recordsPerChunk, collected.count)])
-            }
-            self.uploadRecentWindowChunks(
-                chunks,
-                index: 0,
+            self.uploadRecentWindow(
+                collected,
                 endpoint: endpoint,
                 credential: credential,
                 generation: generation
             ) { ok in
                 self.finishSync(generation: generation)
-                self.logMessage("syncRecentWindow: processed \(collected.count) samples in \(chunks.count) chunk(s) (ok=\(ok))")
+                self.logMessage("syncRecentWindow: processed \(collected.count) samples (ok=\(ok))")
                 completion(ok)
             }
         }
     }
 
+    /// Uploads the samples `syncRecentWindow` re-read, with the foods HealthKit holds around
+    /// their loose dietary samples.
+    internal func uploadRecentWindow(
+        _ samples: [HKSample],
+        endpoint: URL,
+        credential: String,
+        generation: Int,
+        completion: @escaping (Bool) -> Void
+    ) {
+        fetchFoodParents(forLooseDietaryIn: samples) { [weak self] foodsAround in
+            guard let self = self else { completion(false); return }
+            self.uploadRecentWindow(
+                samples,
+                foodsAround: foodsAround,
+                endpoint: endpoint,
+                credential: credential,
+                generation: generation,
+                completion: completion
+            )
+        }
+    }
+
+    /// Uploads `samples`, `recordsPerChunk` at a time, so that every nutrient goes out once,
+    /// under its food when it has one, as in a sync round.
+    ///
+    /// A food can start before the window while a nutrient of it is inside. No later round
+    /// re-sends a window, so that food goes out with the window instead of the nutrient being
+    /// left to it. Chunks are cut by count, so a food and its nutrients can land in different
+    /// chunks: every chunk is built knowing the children of every food in the upload.
+    internal func uploadRecentWindow(
+        _ samples: [HKSample],
+        foodsAround: [HKCorrelation],
+        endpoint: URL,
+        credential: String,
+        generation: Int,
+        completion: @escaping (Bool) -> Void
+    ) {
+        let inWindow = Set(samples.map { $0.uuid })
+        let foodsStartingOutside = foodsAround.filter { food in
+            !inWindow.contains(food.uuid) && food.objects.contains { inWindow.contains($0.uuid) }
+        }
+        let upload = samples + foodsStartingOutside
+        let knownFoodChildIds = _foodChildIds(in: upload)
+        let chunks = stride(from: 0, to: upload.count, by: recordsPerChunk).map {
+            Array(upload[$0..<min($0 + recordsPerChunk, upload.count)])
+        }
+        uploadRecentWindowChunks(
+            chunks,
+            index: 0,
+            knownFoodChildIds: knownFoodChildIds,
+            endpoint: endpoint,
+            credential: credential,
+            generation: generation,
+            completion: completion
+        )
+    }
+
     private func uploadRecentWindowChunks(
         _ chunks: [[HKSample]],
         index: Int,
+        knownFoodChildIds: Set<UUID>,
         endpoint: URL,
         credential: String,
         generation: Int,
@@ -816,11 +879,16 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
             completion(true)
             return
         }
+        let syncContext = SyncRequestContext(
+            inBackground: backgroundTimeRemainingIfInBackground() != nil,
+            trigger: .recentWindow
+        )
         uploadCombinedPayload(
-            payload: buildCombinedPayload(samples: chunks[index]),
+            payload: buildCombinedPayload(samples: chunks[index], knownFoodChildIds: knownFoodChildIds),
             endpoint: endpoint,
             credential: credential,
-            generation: generation
+            generation: generation,
+            syncContext: syncContext
         ) { [weak self] success in
             guard let self = self, success else {
                 completion(false)
@@ -829,6 +897,7 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
             self.uploadRecentWindowChunks(
                 chunks,
                 index: index + 1,
+                knownFoodChildIds: knownFoodChildIds,
                 endpoint: endpoint,
                 credential: credential,
                 generation: generation,
@@ -871,7 +940,7 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         let fullDone = defaults.bool(forKey: fullDoneKey())
         if hasResumableSyncSession() || !fullDone {
             logMessage("Found interrupted sync, will resume...")
-            syncAll(fullExport: false) {
+            syncAll(fullExport: false, trigger: .restore) {
                 self.logMessage("Resumed sync completed")
             }
         }
@@ -887,7 +956,7 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
             return
         }
         
-        let readTypes = Set(getQueryableTypes())
+        let readTypes = Set(typesForAuthorization())
         logMessage("Requesting read-only auth for \(readTypes.count) types")
         
         healthStore.requestAuthorization(toShare: nil, read: readTypes) { ok, _ in
@@ -900,26 +969,57 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
     }
     
     internal func getQueryableTypes() -> [HKSampleType] {
+        queryableTypes(of: trackedTypes)
+    }
+
+    /// `getQueryableTypes()` for any set of tracked types (Rhise fork, for
+    /// `typesForAuthorization(of:)`).
+    internal func queryableTypes(of tracked: [HKSampleType]) -> [HKSampleType] {
+        // Blood pressure is synced from the systolic and diastolic samples.
+        // Food stays here: the correlation is queried for the parent meal, but
+        // HealthKit refuses it in requestAuthorization (see typesForAuthorization).
+        // Workout routes ride on the workout (`fetchWorkoutRoutes`), never as records.
         let disallowedIdentifiers: Set<String> = [
-            HKCorrelationTypeIdentifier.bloodPressure.rawValue
+            HKCorrelationTypeIdentifier.bloodPressure.rawValue,
+            HKSeriesType.workoutRoute().identifier
         ]
         
-        return trackedTypes.filter { type in
+        return tracked.filter { type in
             !disallowedIdentifiers.contains(type.identifier)
         }
     }
 
+    /// Types safe to pass to `HKHealthStore.requestAuthorization`.
+    ///
+    /// `HKCorrelationTypeIdentifierFood` (and blood pressure, already dropped by
+    /// `getQueryableTypes`) cannot be authorized directly. HealthKit throws
+    /// `NSInvalidArgumentException` if they are in the read set. Read access to a
+    /// food correlation comes from the dietary quantity types it contains.
+    /// The workout route type is not queried on its own but still needs read access.
+    internal func typesForAuthorization() -> [HKSampleType] {
+        typesForAuthorization(of: trackedTypes)
+    }
+
+    /// `typesForAuthorization()` for any set of tracked types, without tracking them (Rhise
+    /// fork). The React Native bridge's authorization probe asks HealthKit about this set, so
+    /// it asks about exactly what `requestAuthorization(types:)` requests for the same types.
+    internal func typesForAuthorization(of tracked: [HKSampleType]) -> [HKSampleType] {
+        queryableTypes(of: tracked).filter { type in
+            type.identifier != HKCorrelationTypeIdentifier.food.rawValue
+        } + tracked.filter { $0.identifier == HKSeriesType.workoutRoute().identifier }
+    }
+
     // MARK: - Internal: Sync
     
-    internal func syncAll(fullExport: Bool, completion: @escaping () -> Void) {
+    internal func syncAll(fullExport: Bool, trigger: SyncTrigger, completion: @escaping () -> Void) {
         guard !trackedTypes.isEmpty else { completion(); return }
-        
+
         guard self.hasAuth else {
             self.logMessage("No auth credential for sync")
             completion()
             return
         }
-        self.collectAllData(fullExport: fullExport, completion: completion)
+        self.collectAllData(fullExport: fullExport, isBackground: false, trigger: trigger, completion: completion)
     }
     
     internal func triggerCombinedSync() {
@@ -935,7 +1035,7 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         let workItem = DispatchWorkItem { [weak self] in
             guard let self = self else { return }
             self.setObserverSyncPending(false)
-            self.syncAll(fullExport: false) {
+            self.syncAll(fullExport: false, trigger: .healthKitObserver) {
                 // A trigger that found another run in the slot leaves the assertion to
                 // that run, which ends it from `finishSync` when it unwinds.
                 self.endObserverBgTaskIfIdle()
@@ -947,10 +1047,6 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         syncDebounceQueue.asyncAfter(deadline: .now() + 2.0, execute: workItem)
     }
     
-    internal func collectAllData(fullExport: Bool, completion: @escaping () -> Void) {
-        collectAllData(fullExport: fullExport, isBackground: false, completion: completion)
-    }
-
     private func beginObserverBgTaskIfNeeded() {
         observerBgTaskLock.lock()
         defer { observerBgTaskLock.unlock() }
@@ -996,8 +1092,13 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         defer { observerBgTaskLock.unlock() }
         return observerBgTask != .invalid
     }
-    
-    internal func collectAllData(fullExport: Bool, isBackground: Bool, completion: @escaping () -> Void) {
+
+    internal func collectAllData(
+        fullExport: Bool,
+        isBackground: Bool,
+        trigger: SyncTrigger,
+        completion: @escaping () -> Void
+    ) {
         guard let generation = beginSyncRun() else {
             logMessage("Sync in progress, skipping")
             completion()
@@ -1078,6 +1179,7 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
                 fullExport: effectiveFullExport,
                 endpoint: endpoint,
                 isBackground: isBackground,
+                trigger: trigger,
                 generation: generation
             ) { [weak self] allTypesCompleted in
                 guard let self = self else { return }
@@ -1152,10 +1254,13 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         let generation: Int
         /// Whether the caller already knows it runs in the background (BG tasks do).
         let declaredBackground: Bool
-        
-        init(generation: Int, declaredBackground: Bool) {
+        /// What started this run; sent with every upload.
+        let trigger: SyncTrigger
+
+        init(generation: Int, declaredBackground: Bool, trigger: SyncTrigger) {
             self.generation = generation
             self.declaredBackground = declaredBackground
+            self.trigger = trigger
         }
     }
     
@@ -1175,10 +1280,11 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         fullExport: Bool,
         endpoint: URL,
         isBackground: Bool,
+        trigger: SyncTrigger,
         generation: Int,
         completion: @escaping (Bool) -> Void
     ) {
-        let rrState = RoundRobinState(generation: generation, declaredBackground: isBackground)
+        let rrState = RoundRobinState(generation: generation, declaredBackground: isBackground, trigger: trigger)
         
         let resumeInfo = getResumeCursors()
         rrState.completedTypes = resumeInfo.completedTypes
@@ -1315,57 +1421,278 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
                 return
             }
             
-            let payload = self.buildCombinedPayload(samples: allSamples)
-            
-            self.uploadCombinedPayload(
-                payload: payload, endpoint: endpoint, credential: freshCredential,
-                generation: rrState.generation
-            ) { [weak self] sendSuccess in
+            self.fetchFoodChildIds(forLooseDietaryIn: allSamples) { [weak self] knownFoodChildIds in
                 guard let self = self else { completion(false); return }
-                if !sendSuccess { completion(false); return }
                 if self.isSyncCancelled(generation: rrState.generation) {
                     completion(false)
                     return
                 }
-                
-                // Phase 3: Update progress for all types that had data
-                for result in withData {
-                    if fullExport {
-                        self.updateTypeProgress(
-                            typeIdentifier: result.type.identifier, sentInChunk: result.count,
-                            isComplete: false, anchorData: nil, olderThan: result.nextOlderThan
-                        )
-                    } else {
-                        self.updateTypeProgress(
-                            typeIdentifier: result.type.identifier, sentInChunk: result.count,
-                            isComplete: result.isDone, anchorData: result.anchorData
-                        )
-                        if result.isDone {
-                            rrState.completedTypes.insert(result.type.identifier)
+
+                self.fetchWorkoutRoutes(for: allSamples) { [weak self] workoutRoutes in
+                    guard let self = self else { completion(false); return }
+                    if self.isSyncCancelled(generation: rrState.generation) {
+                        completion(false)
+                        return
+                    }
+
+                    let payload = self.buildCombinedPayload(
+                        samples: allSamples, knownFoodChildIds: knownFoodChildIds, workoutRoutes: workoutRoutes
+                    )
+                    // The actual app state, not `declaredBackground`: observer and resume
+                    // syncs are declared foreground but usually run while suspended.
+                    let syncContext = SyncRequestContext(
+                        inBackground: self.backgroundTimeRemainingIfInBackground() != nil,
+                        trigger: rrState.trigger
+                    )
+
+                    self.uploadCombinedPayload(
+                        payload: payload, endpoint: endpoint, credential: freshCredential,
+                        generation: rrState.generation, syncContext: syncContext
+                    ) { [weak self] sendSuccess in
+                        guard let self = self else { completion(false); return }
+                        if !sendSuccess { completion(false); return }
+                        if self.isSyncCancelled(generation: rrState.generation) {
+                            completion(false)
+                            return
+                        }
+
+                        // Phase 3: Update progress for all types that had data
+                        for result in withData {
+                            if fullExport {
+                                self.updateTypeProgress(
+                                    typeIdentifier: result.type.identifier, sentInChunk: result.count,
+                                    isComplete: false, anchorData: nil, olderThan: result.nextOlderThan
+                                )
+                            } else {
+                                self.updateTypeProgress(
+                                    typeIdentifier: result.type.identifier, sentInChunk: result.count,
+                                    isComplete: result.isDone, anchorData: result.anchorData
+                                )
+                                if result.isDone {
+                                    rrState.completedTypes.insert(result.type.identifier)
+                                }
+                            }
+                        }
+
+                        // Phase 4: For full export, capture anchors for done types
+                        let fullExportDone = withData.filter { $0.isDone }.map { $0.type } + doneTypesForAnchorCapture.filter { t in !withData.contains(where: { $0.type == t }) }
+                        if fullExport && !fullExportDone.isEmpty {
+                            self.captureAnchorsForDoneTypes(types: fullExportDone, index: 0, rrState: rrState) { captureOk in
+                                guard captureOk else { completion(false); return }
+                                self.processNextRound(
+                                    types: types, fullExport: fullExport, endpoint: endpoint,
+                                    rrState: rrState, completion: completion
+                                )
+                            }
+                        } else {
+                            self.processNextRound(
+                                types: types, fullExport: fullExport, endpoint: endpoint,
+                                rrState: rrState, completion: completion
+                            )
                         }
                     }
-                }
-                
-                // Phase 4: For full export, capture anchors for done types
-                let fullExportDone = withData.filter { $0.isDone }.map { $0.type } + doneTypesForAnchorCapture.filter { t in !withData.contains(where: { $0.type == t }) }
-                if fullExport && !fullExportDone.isEmpty {
-                    self.captureAnchorsForDoneTypes(types: fullExportDone, index: 0, rrState: rrState) { captureOk in
-                        guard captureOk else { completion(false); return }
-                        self.processNextRound(
-                            types: types, fullExport: fullExport, endpoint: endpoint,
-                            rrState: rrState, completion: completion
-                        )
-                    }
-                } else {
-                    self.processNextRound(
-                        types: types, fullExport: fullExport, endpoint: endpoint,
-                        rrState: rrState, completion: completion
-                    )
                 }
             }
         }
     }
-    
+
+    // MARK: - Food parents of loose dietary samples
+
+    /// Each type has its own cursor, so a dietary sample can come in a round where its
+    /// food correlation does not (the food query returned it in another round). Look up
+    /// the food correlations around such samples so the payload leaves them to the food
+    /// query instead of also sending them as loose samples with no `parentId`.
+    /// Returns an empty set when there is nothing to check or the lookup fails - the
+    /// samples then go out loose, as before.
+    private func fetchFoodChildIds(
+        forLooseDietaryIn samples: [HKSample],
+        completion: @escaping (Set<UUID>) -> Void
+    ) {
+        fetchFoodParents(forLooseDietaryIn: samples) { parents in
+            completion(Set(parents.flatMap { $0.objects.map { $0.uuid } }))
+        }
+    }
+
+    /// The food correlations HealthKit holds around the loose dietary samples in `samples`:
+    /// the lookup behind `fetchFoodChildIds`, which `uploadRecentWindow` (Rhise fork) needs
+    /// whole, to send a food that starts outside its window. Empty when there is nothing to
+    /// check or the lookup fails.
+    private func fetchFoodParents(
+        forLooseDietaryIn samples: [HKSample],
+        completion: @escaping ([HKCorrelation]) -> Void
+    ) {
+        // Without the food type tracked, nothing else would ever send these samples.
+        guard let foodType = HKObjectType.correlationType(forIdentifier: .food),
+              trackedTypes.contains(where: { $0.identifier == foodType.identifier }) else {
+            completion([])
+            return
+        }
+
+        let childIdsInRound = Set(samples
+            .compactMap { $0 as? HKCorrelation }
+            .filter { $0.correlationType.identifier == foodType.identifier }
+            .flatMap { $0.objects.map { $0.uuid } })
+        let looseDietary = samples
+            .compactMap { $0 as? HKQuantitySample }
+            .filter { $0.quantityType.identifier.hasPrefix("HKQuantityTypeIdentifierDietary") && !childIdsInRound.contains($0.uuid) }
+        guard let start = looseDietary.map({ $0.startDate }).min(),
+              let end = looseDietary.map({ $0.endDate }).max() else {
+            completion([])
+            return
+        }
+
+        // Children normally share the food's dates; the margin catches ones that don't.
+        let margin: TimeInterval = 24 * 60 * 60
+        let predicate = HKQuery.predicateForSamples(
+            withStart: start.addingTimeInterval(-margin), end: end.addingTimeInterval(margin), options: []
+        )
+        let query = HKCorrelationQuery(type: foodType, predicate: predicate, samplePredicates: nil) {
+            [weak self] _, correlations, error in
+            if let error = error {
+                self?.logMessage("food: parent lookup for \(looseDietary.count) dietary samples failed - \(error.localizedDescription)")
+                completion([])
+                return
+            }
+            completion(correlations ?? [])
+        }
+        healthStore.execute(query)
+    }
+
+    // MARK: - Workout routes
+
+    /// Upper bound for reading the routes of one round. A 1 h route is ~3600 locations
+    /// and normally reads well under a second; the cap keeps a slow HealthKit from
+    /// holding the round (and, in the background, the task assertion).
+    internal static let workoutRouteFetchBudget: TimeInterval = 10
+
+    /// Workouts per round while routes are read. The record chunk counts a workout as
+    /// one item, but with its route it is ~0.25 MB per hour of GPS, so a 2000-record
+    /// round of a full export carried 150+ routes (~65 MB) in one upload. Five keeps a
+    /// round at a few MB even for long hikes.
+    internal static let workoutsPerRoundWithRoutes = 5
+
+    internal var tracksWorkoutRoutes: Bool {
+        let routeIdentifier = HKSeriesType.workoutRoute().identifier
+        return trackedTypes.contains { $0.identifier == routeIdentifier }
+    }
+
+    /// Chunk limit for one type in a round: the shared per-type limit, lowered for
+    /// workouts while their routes are sent along.
+    internal func roundChunkLimit(for type: HKSampleType, perTypeLimit: Int) -> Int {
+        guard type.identifier == HKObjectType.workoutType().identifier, tracksWorkoutRoutes else {
+            return perTypeLimit
+        }
+        return min(perTypeLimit, Self.workoutsPerRoundWithRoutes)
+    }
+
+    /// Reads the `HKWorkoutRoute` locations of every workout in the round, keyed by
+    /// workout UUID. Only runs when `.workoutRoute` is tracked. A workout without a
+    /// route, a failed query or one still running when the budget runs out is left out
+    /// of the result, so that workout is sent with `route: null` and the round goes on.
+    /// The workout cursor advances either way, so such a route is not re-sent later.
+    private func fetchWorkoutRoutes(
+        for samples: [HKSample],
+        completion: @escaping ([UUID: [CLLocation]]) -> Void
+    ) {
+        let routeType = HKSeriesType.workoutRoute()
+        let workouts = samples.compactMap { $0 as? HKWorkout }
+        guard !workouts.isEmpty, tracksWorkoutRoutes else {
+            completion([:])
+            return
+        }
+
+        // In the background leave room for the upload (it needs >= 5 s, see processNextRound).
+        var budget = Self.workoutRouteFetchBudget
+        if let remaining = backgroundTimeRemainingIfInBackground() {
+            budget = max(1, min(budget, remaining - 8))
+        }
+
+        let lock = NSLock()
+        var routes: [UUID: [CLLocation]] = [:]
+        var queries: [HKQuery] = []
+        var pending = workouts.count
+        var finished = false
+
+        let finish: () -> Void = { [weak self] in
+            lock.lock()
+            guard !finished else { lock.unlock(); return }
+            finished = true
+            let result = routes
+            let stillRunning = queries
+            let missing = pending
+            lock.unlock()
+            if missing > 0 {
+                for query in stillRunning { self?.healthStore.stop(query) }
+                self?.logMessage("route: \(missing) of \(workouts.count) workouts not read within \(Int(budget))s, sent without route")
+            }
+            completion(result)
+        }
+        let register: (HKQuery) -> Bool = { query in
+            lock.lock()
+            defer { lock.unlock() }
+            guard !finished else { return false }
+            queries.append(query)
+            return true
+        }
+        let workoutDone: (UUID, [CLLocation]) -> Void = { id, locations in
+            lock.lock()
+            if !finished && !locations.isEmpty { routes[id] = locations }
+            pending -= 1
+            let allDone = pending == 0
+            lock.unlock()
+            if allDone { finish() }
+        }
+
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + budget, execute: finish)
+
+        for workout in workouts {
+            let routeQuery = HKSampleQuery(
+                sampleType: routeType,
+                predicate: HKQuery.predicateForObjects(from: workout),
+                limit: HKObjectQueryNoLimit,
+                sortDescriptors: nil
+            ) { [weak self] _, results, error in
+                let workoutRoutes = (results as? [HKWorkoutRoute]) ?? []
+                guard let self = self, error == nil, !workoutRoutes.isEmpty else {
+                    workoutDone(workout.uuid, [])
+                    return
+                }
+                self.readLocations(of: workoutRoutes, register: register) { locations in
+                    workoutDone(workout.uuid, locations)
+                }
+            }
+            if register(routeQuery) { healthStore.execute(routeQuery) }
+        }
+    }
+
+    /// Streams the locations of each route (HealthKit delivers them in batches) and
+    /// concatenates them. A failed route contributes nothing.
+    private func readLocations(
+        of routes: [HKWorkoutRoute],
+        register: @escaping (HKQuery) -> Bool,
+        completion: @escaping ([CLLocation]) -> Void
+    ) {
+        let lock = NSLock()
+        var locations: [CLLocation] = []
+        var remaining = routes.count
+
+        for route in routes {
+            var routeLocations: [CLLocation] = []
+            let query = HKWorkoutRouteQuery(route: route) { _, batch, done, error in
+                if error == nil, let batch = batch { routeLocations.append(contentsOf: batch) }
+                guard done || error != nil else { return }
+                lock.lock()
+                if error == nil { locations.append(contentsOf: routeLocations) }
+                remaining -= 1
+                let allDone = remaining == 0
+                let result = locations
+                lock.unlock()
+                if allDone { completion(result) }
+            }
+            if register(query) { healthStore.execute(query) }
+        }
+    }
+
     // MARK: - Fetch all types in a round (no network, accumulates results)
     
     private func fetchTypesInRound(
@@ -1380,10 +1707,11 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         }
         
         let type = types[index]
+        let typeLimit = roundChunkLimit(for: type, perTypeLimit: chunkLimit)
         
         if fullExport {
             let cursor = rrState.olderThanCursors[type.identifier]
-            fetchOneChunkNewestFirst(type: type, olderThan: cursor, chunkLimit: chunkLimit, generation: rrState.generation) {
+            fetchOneChunkNewestFirst(type: type, olderThan: cursor, chunkLimit: typeLimit, generation: rrState.generation) {
                 [weak self] success, samples, nextOlderThan, isDone in
                 guard let self = self else { completion(false, accumulated); return }
                 if !success { completion(false, accumulated); return }
@@ -1400,7 +1728,7 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
             }
         } else {
             let anchor = rrState.anchorCursors[type.identifier]
-            fetchOneChunkIncremental(type: type, anchor: anchor, chunkLimit: chunkLimit, generation: rrState.generation) {
+            fetchOneChunkIncremental(type: type, anchor: anchor, chunkLimit: typeLimit, generation: rrState.generation) {
                 [weak self] success, samples, newAnchor, anchorData, isDone in
                 guard let self = self else { completion(false, accumulated); return }
                 if !success { completion(false, accumulated); return }
@@ -2112,7 +2440,7 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
                         return
                     }
                     
-                    self.syncAll(fullExport: false) {
+                    self.syncAll(fullExport: false, trigger: .unlock) {
                         self.logMessage("Deferred sync after unlock completed")
                     }
                 }
@@ -2172,7 +2500,7 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
             }
             
             self.logMessage("App returned to foreground - resuming sync...")
-            self.syncAll(fullExport: false) {
+            self.syncAll(fullExport: false, trigger: .foreground) {
                 self.logMessage("Foreground resume sync completed")
             }
         }
@@ -2202,7 +2530,7 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
             }
             
             self.logMessage("Resuming sync after network restored...")
-            self.syncAll(fullExport: false) {
+            self.syncAll(fullExport: false, trigger: .network) {
                 self.logMessage("Network resume sync completed")
             }
         }
