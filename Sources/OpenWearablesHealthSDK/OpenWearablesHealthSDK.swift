@@ -756,9 +756,15 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
             ) { [weak self] _, samples, error in
                 if let error = error {
                     self?.logMessage("syncRecentWindow: \(self?.shortTypeName(type.identifier) ?? type.identifier) error: \(error.localizedDescription)")
-                    collectLock.lock()
-                    queryFailed = true
-                    collectLock.unlock()
+                    // A type HealthKit cannot read contributes nothing, as it does to the
+                    // export, instead of failing the replay of every other type on every
+                    // app open. Any other failure fails the replay, so the host keeps its
+                    // window and replays it.
+                    if self?.readFailure(of: error) != .unreadable {
+                        collectLock.lock()
+                        queryFailed = true
+                        collectLock.unlock()
+                    }
                 }
                 if let samples = samples, !samples.isEmpty {
                     collectLock.lock()
@@ -1752,29 +1758,53 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         }
         
         let type = types[index]
-        captureCurrentAnchor(for: type) { [weak self] anchor in
+        captureCurrentAnchor(for: type) { [weak self] outcome in
             guard let self = self else { completion(false); return }
             if self.isSyncCancelled(generation: rrState.generation) {
                 completion(false)
                 return
             }
-            
-            // Without a valid anchor the type must NOT be marked complete: the next
-            // incremental sync would run an anchored query from nil and re-crawl the
-            // whole history oldest-first. Pause the sync instead - on resume the type
-            // re-sends its last chunk (deduplicated server-side) and retries capture.
-            guard let anchor = anchor,
-                  let anchorData = try? NSKeyedArchiver.archivedData(withRootObject: anchor, requiringSecureCoding: true) else {
-                self.logMessage("  \(self.shortTypeName(type.identifier)): anchor capture failed - leaving type incomplete, pausing sync")
+            guard self.recordAnchorCapture(outcome, for: type.identifier) else {
                 completion(false)
                 return
             }
-            
-            self.updateTypeProgress(typeIdentifier: type.identifier, sentInChunk: 0, isComplete: true, anchorData: anchorData)
             rrState.completedTypes.insert(type.identifier)
-            self.fireTypeCompletedLog(type.identifier)
-            self.logMessage("  \(self.shortTypeName(type.identifier)): complete (anchor captured)")
             self.captureAnchorsForDoneTypes(types: types, index: index + 1, rrState: rrState, completion: completion)
+        }
+    }
+
+    /// Records how a done type's anchor capture came out, and says whether the export
+    /// goes on to the next type.
+    ///
+    /// - A captured anchor completes the type with it; incremental sync continues from it.
+    /// - An unreadable type completes without one. Nothing was read from it, so once
+    ///   HealthKit allows it, incremental sync reads it from the start, which is the
+    ///   export it never had. Leaving it incomplete paused every run at this type for
+    ///   good: the initial export never finished and no new data was sent (RHISE-8003).
+    /// - Anything else leaves the type incomplete and pauses the run. A readable type
+    ///   completed without an anchor would make the next incremental sync re-crawl its
+    ///   whole history oldest-first; on resume the type re-sends its last chunk
+    ///   (deduplicated server-side) and retries the capture.
+    internal func recordAnchorCapture(_ outcome: AnchorCaptureOutcome, for typeIdentifier: String) -> Bool {
+        let name = shortTypeName(typeIdentifier)
+        switch outcome {
+        case .captured(let anchor):
+            guard let anchorData = try? NSKeyedArchiver.archivedData(withRootObject: anchor, requiringSecureCoding: true) else {
+                logMessage("  \(name): anchor capture failed - leaving type incomplete, pausing sync")
+                return false
+            }
+            updateTypeProgress(typeIdentifier: typeIdentifier, sentInChunk: 0, isComplete: true, anchorData: anchorData)
+            fireTypeCompletedLog(typeIdentifier)
+            logMessage("  \(name): complete (anchor captured)")
+            return true
+        case .unreadable:
+            updateTypeProgress(typeIdentifier: typeIdentifier, sentInChunk: 0, isComplete: true, anchorData: nil)
+            fireTypeCompletedLog(typeIdentifier)
+            logMessage("  \(name): complete without an anchor (HealthKit cannot read it yet)")
+            return true
+        case .retryLater:
+            logMessage("  \(name): anchor capture failed - leaving type incomplete, pausing sync")
+            return false
         }
     }
     
@@ -1804,14 +1834,20 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
                 if self.isSyncCancelled(generation: generation) { completion(false, [], nil, false); return }
                 
                 if let error = error {
-                    if self.isProtectedDataError(error) {
+                    switch self.readFailure(of: error) {
+                    case .retryAfterUnlock:
                         self.logMessage("\(self.shortTypeName(type.identifier)): protected data inaccessible - pausing sync")
                         self.pendingSyncAfterUnlock = true
                         completion(false, [], nil, false)
-                        return
+                    case .unreadable:
+                        self.logMessage("\(self.shortTypeName(type.identifier)): \(error.localizedDescription) - skipping")
+                        completion(true, [], nil, true)
+                    case .retryLater:
+                        // Not "done": the export would mark the type complete with the rest
+                        // of its history unread. The cursor stays, the next run retries.
+                        self.logMessage("\(self.shortTypeName(type.identifier)): \(error.localizedDescription) - pausing sync")
+                        completion(false, [], nil, false)
                     }
-                    self.logMessage("\(self.shortTypeName(type.identifier)): \(error.localizedDescription) - skipping")
-                    completion(true, [], nil, true)
                     return
                 }
                 
@@ -1851,14 +1887,17 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
                 if self.isSyncCancelled(generation: generation) { completion(false, [], nil, nil, false); return }
                 
                 if let error = error {
-                    if self.isProtectedDataError(error) {
+                    switch self.readFailure(of: error) {
+                    case .retryAfterUnlock:
                         self.logMessage("\(self.shortTypeName(type.identifier)): protected data inaccessible - pausing sync")
                         self.pendingSyncAfterUnlock = true
                         completion(false, [], nil, nil, false)
-                        return
+                    case .unreadable, .retryLater:
+                        // Skipping returns no anchor, so the saved one stays and the next run
+                        // reads this type again; pausing would hold back every other type.
+                        self.logMessage("\(self.shortTypeName(type.identifier)): \(error.localizedDescription) - skipping")
+                        completion(true, [], nil, nil, true)
                     }
-                    self.logMessage("\(self.shortTypeName(type.identifier)): \(error.localizedDescription) - skipping")
-                    completion(true, [], nil, nil, true)
                     return
                 }
                 
@@ -1890,30 +1929,35 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
     
     // MARK: - Anchor Capture (for incremental sync after full export)
     
-    private func captureCurrentAnchor(for type: HKSampleType, completion: @escaping (HKQueryAnchor?) -> Void) {
+    private func captureCurrentAnchor(for type: HKSampleType, completion: @escaping (AnchorCaptureOutcome) -> Void) {
         logMessage("  \(shortTypeName(type.identifier)): saving anchor...")
         captureAnchorStep(type: type, anchor: nil, limit: 10000, completion: completion)
     }
     
-    private func captureAnchorStep(type: HKSampleType, anchor: HKQueryAnchor?, limit: Int, completion: @escaping (HKQueryAnchor?) -> Void) {
+    private func captureAnchorStep(type: HKSampleType, anchor: HKQueryAnchor?, limit: Int, completion: @escaping (AnchorCaptureOutcome) -> Void) {
         let syncPredicate: NSPredicate? = {
             guard let start = syncStartDate() else { return nil }
             return HKQuery.predicateForSamples(withStart: start, end: nil, options: [])
         }()
         let query = HKAnchoredObjectQuery(type: type, predicate: syncPredicate, anchor: anchor, limit: limit) {
             [weak self] _, samples, deletedObjects, newAnchor, error in
-            guard let self = self else { completion(nil); return }
+            guard let self = self else { completion(.retryLater); return }
             
             if let error = error {
-                // A failed step must not return a stale/nil anchor - the caller would
-                // persist it and the next incremental sync would re-crawl history.
-                if self.isProtectedDataError(error) {
+                // A failed step never returns a partial anchor: the caller would keep it
+                // and the next incremental sync would miss what lies past it.
+                switch self.readFailure(of: error) {
+                case .retryAfterUnlock:
                     self.logMessage("\(self.shortTypeName(type.identifier)): protected data inaccessible during anchor capture - will retry after unlock")
                     self.pendingSyncAfterUnlock = true
-                } else {
+                    completion(.retryLater)
+                case .unreadable:
                     self.logMessage("\(self.shortTypeName(type.identifier)): anchor capture failed - \(error.localizedDescription)")
+                    completion(.unreadable)
+                case .retryLater:
+                    self.logMessage("\(self.shortTypeName(type.identifier)): anchor capture failed - \(error.localizedDescription)")
+                    completion(.retryLater)
                 }
-                completion(nil)
                 return
             }
             
@@ -1922,8 +1966,10 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
             let count = (samples?.count ?? 0) + (deletedObjects?.count ?? 0)
             if count >= limit {
                 self.captureAnchorStep(type: type, anchor: newAnchor, limit: limit, completion: completion)
+            } else if let newAnchor = newAnchor {
+                completion(.captured(newAnchor))
             } else {
-                completion(newAnchor)
+                completion(.retryLater)
             }
         }
         healthStore.execute(query)
@@ -2490,7 +2536,7 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         }
     }
     
-    // MARK: - Protected Data Error Detection
+    // MARK: - HealthKit Read Failures
     
     internal func isProtectedDataError(_ error: Error) -> Bool {
         let nsError = error as NSError
@@ -2500,6 +2546,38 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         let msg = error.localizedDescription.lowercased()
         return msg.contains("protected health data") || msg.contains("inaccessible")
     }
+
+    /// What a failed HealthKit read means for a sync. Every read decides through this
+    /// one function: the full-export crawl, the incremental crawl, the anchor capture
+    /// after an export and the recent-window replay.
+    internal func readFailure(of error: Error) -> HealthKitReadFailure {
+        if isProtectedDataError(error) {
+            return .retryAfterUnlock
+        }
+        let nsError = error as NSError
+        if nsError.domain == HKErrorDomain && Self.unreadableTypeErrorCodes.contains(nsError.code) {
+            return .unreadable
+        }
+        return .retryLater
+    }
+
+    /// HealthKit errors that no retry fixes: authorization the user has not given (or
+    /// was never asked for), HealthKit unavailable or restricted on this device, a guest
+    /// user, or a query HealthKit rejects as invalid.
+    private static let unreadableTypeErrorCodes: Set<Int> = {
+        var codes: Set<Int> = [
+            HKError.Code.errorHealthDataUnavailable.rawValue,
+            HKError.Code.errorHealthDataRestricted.rawValue,
+            HKError.Code.errorInvalidArgument.rawValue,
+            HKError.Code.errorAuthorizationDenied.rawValue,
+            HKError.Code.errorAuthorizationNotDetermined.rawValue,
+            HKError.Code.errorRequiredAuthorizationDenied.rawValue,
+        ]
+        if #available(iOS 18.0, *) {
+            codes.insert(HKError.Code.errorNotPermissibleForGuestUserMode.rawValue)
+        }
+        return codes
+    }()
     
     // MARK: - Helpers
     

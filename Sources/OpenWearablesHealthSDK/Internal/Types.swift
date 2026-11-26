@@ -368,6 +368,33 @@ public enum HealthDataType: String, CaseIterable, Sendable {
     }
 }
 
+// MARK: - Read failures
+
+/// What a failed HealthKit read means for a sync (`readFailure(of:)` decides).
+internal enum HealthKitReadFailure: Equatable {
+    /// Protected health data is locked with the device. The same read succeeds after
+    /// unlock, so the run stops and resumes then.
+    case retryAfterUnlock
+    /// HealthKit will not read this type until the user or the device changes something,
+    /// for example HKError 5 "Authorization not determined" for a tracked type whose
+    /// permission sheet was never answered. Retrying changes nothing, so the type has
+    /// nothing to send and must not hold back the other types.
+    case unreadable
+    /// Any other failure. The same read may succeed on the next run, so nothing that
+    /// depends on it is treated as read.
+    case retryLater
+}
+
+/// How the anchor capture that ends a type's full export came out.
+internal enum AnchorCaptureOutcome {
+    case captured(HKQueryAnchor)
+    /// HealthKit cannot read the type (`HealthKitReadFailure.unreadable`), so nothing
+    /// was read from it and there is no anchor to keep.
+    case unreadable
+    /// The capture did not finish (device locked, or HealthKit returned no anchor).
+    case retryLater
+}
+
 extension OpenWearablesHealthSDK {
 
     // MARK: - Combined payload
