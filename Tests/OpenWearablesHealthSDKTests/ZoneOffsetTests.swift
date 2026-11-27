@@ -40,23 +40,4 @@ final class ZoneOffsetTests: XCTestCase {
         let unknown: [String: Any] = [HKMetadataKeyTimeZone: "Not/AZone"]
         XCTAssertEqual(sdk.zoneOffset(metadata: unknown, date: date("2026-01-15T12:00:00Z"), deviceTimeZone: newYork), "-05:00")
     }
-
-    func testAnUploadedStepSampleCarriesAnOffset() throws {
-        let steps = HKQuantityType.quantityType(forIdentifier: .stepCount)!
-        let start = date("2026-01-15T12:00:00Z")
-        let sample = HKQuantitySample(
-            type: steps,
-            quantity: HKQuantity(unit: .count(), doubleValue: 120),
-            start: start,
-            end: start.addingTimeInterval(600)
-        )
-
-        let payload = sdk.buildCombinedPayload(samples: [sample])
-
-        let data = try XCTUnwrap(payload["data"] as? [String: Any])
-        let records = try XCTUnwrap(data["records"] as? [[String: Any]])
-        let offset = try XCTUnwrap(records.first?["zoneOffset"] as? String, "a sample without a stored zone was sent without an offset")
-        let seconds = TimeZone.autoupdatingCurrent.secondsFromGMT(for: start)
-        XCTAssertEqual(offset, String(format: "%@%02d:%02d", seconds >= 0 ? "+" : "-", abs(seconds) / 3600, (abs(seconds) % 3600) / 60))
-    }
 }

@@ -250,7 +250,13 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
     private var foregroundObserver: NSObjectProtocol?
 
     // Per-user state (anchors)
-    internal let defaults = UserDefaults(suiteName: "com.openwearables.healthsdk.state") ?? .standard
+    internal let defaults = OpenWearablesHealthSDK.stateDefaults
+    private static let stateDefaults = UserDefaults(suiteName: "com.openwearables.healthsdk.state") ?? .standard
+
+    /// The zones this phone has been in; gives a sample without a stored zone its offset.
+    /// Kept across sign-out: it describes the device, not the user.
+    internal var zoneLog = ZoneLog(defaults: OpenWearablesHealthSDK.stateDefaults)
+    private var timeZoneObserver: NSObjectProtocol?
 
     /// Overrides the root the SDK keeps its on-disk state under. Production leaves this
     /// nil and resolves to Application Support; tests point it at a temporary directory
@@ -353,6 +359,15 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         fgCfg.timeoutIntervalForResource = 600
         fgCfg.waitsForConnectivity = false
         self.foregroundSession = URLSession(configuration: fgCfg, delegate: nil, delegateQueue: OperationQueue.main)
+
+        // Note the phone's zone now and whenever it changes while the app is alive, so a
+        // sample recorded before a trip is not sent with the zone of the arrival.
+        zoneLog.record(.autoupdatingCurrent, at: Date())
+        timeZoneObserver = NotificationCenter.default.addObserver(
+            forName: .NSSystemTimeZoneDidChange, object: nil, queue: nil
+        ) { [weak self] _ in
+            self?.zoneLog.record(.autoupdatingCurrent, at: Date())
+        }
 
         if #available(iOS 13.0, *) {
             BGTaskScheduler.shared.register(forTaskWithIdentifier: refreshTaskId, using: nil) { [weak self] task in
