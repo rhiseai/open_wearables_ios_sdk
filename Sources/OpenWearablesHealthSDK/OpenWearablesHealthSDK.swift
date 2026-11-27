@@ -1066,6 +1066,7 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
             logMessage("Escalating to full export (initial export not completed yet)")
         }
         
+        var startsNewFullExport = false
         if let state = existingState, state.fullExport == effectiveFullExport {
             if state.hasProgress {
                 logMessage("Resuming sync (fullExport: \(effectiveFullExport), \(state.totalSentCount) already sent, \(state.completedTypes.count) types done)")
@@ -1079,6 +1080,8 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
                 logMessage("Starting streaming sync (fullExport: \(effectiveFullExport), \(queryableTypes.count) types)")
             }
             _ = startNewSyncState(fullExport: effectiveFullExport, types: queryableTypes)
+            // A new full export sends the history: learn first which zones it was recorded in.
+            startsNewFullExport = effectiveFullExport
         }
         
         let syncStartTime = Date()
@@ -1122,6 +1125,25 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
             }
         }
         
+        if startsNewFullExport {
+            seedZoneHistory(types: queryableTypes) { [weak self] in
+                self?.startFullExportOrRoundRobin(
+                    fullExport: effectiveFullExport, types: queryableTypes, existingState: existingState, start: startRoundRobin
+                )
+            }
+        } else {
+            startFullExportOrRoundRobin(
+                fullExport: effectiveFullExport, types: queryableTypes, existingState: existingState, start: startRoundRobin
+            )
+        }
+    }
+
+    private func startFullExportOrRoundRobin(
+        fullExport effectiveFullExport: Bool,
+        types queryableTypes: [HKSampleType],
+        existingState: SyncState?,
+        start startRoundRobin: @escaping () -> Void
+    ) {
         if effectiveFullExport {
             let startDate = syncStartDate()
             let endDate = Date()
