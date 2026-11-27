@@ -918,6 +918,16 @@ extension OpenWearablesHealthSDK {
     // MARK: - Zone Offset
     
     private func _zoneOffsetString(metadata: [String: Any]?, fallback: [String: Any]? = nil, date: Date) -> Any {
+        return zoneOffset(metadata: metadata, fallback: fallback, date: date, deviceTimeZone: .autoupdatingCurrent)
+    }
+
+    /// The UTC offset a sample is sent with: the zone HealthKit stored with it, else its
+    /// correlation's, else the phone's own zone at the sample's time (RHISE-8334).
+    ///
+    /// HealthKit stores `HKMetadataKeyTimeZone` on few samples; most steps, energy, heart
+    /// rate and sleep have none. Sent without an offset, the backend placed them on their
+    /// UTC day. The phone's zone is the one Apple Health shows them in.
+    internal func zoneOffset(metadata: [String: Any]?, fallback: [String: Any]? = nil, date: Date, deviceTimeZone: TimeZone) -> String {
         if let tzName = metadata?[HKMetadataKeyTimeZone] as? String,
            let tz = TimeZone(identifier: tzName) {
             return _formatZoneOffset(tz.secondsFromGMT(for: date))
@@ -926,7 +936,7 @@ extension OpenWearablesHealthSDK {
            let tz = TimeZone(identifier: tzName) {
             return _formatZoneOffset(tz.secondsFromGMT(for: date))
         }
-        return NSNull()
+        return _formatZoneOffset(deviceTimeZone.secondsFromGMT(for: date))
     }
     
     private func _formatZoneOffset(_ totalSeconds: Int) -> String {
