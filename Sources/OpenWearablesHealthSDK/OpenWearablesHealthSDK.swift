@@ -250,7 +250,13 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
     private var foregroundObserver: NSObjectProtocol?
 
     // Per-user state (anchors)
-    internal let defaults = UserDefaults(suiteName: "com.openwearables.healthsdk.state") ?? .standard
+    internal let defaults = OpenWearablesHealthSDK.stateDefaults
+    private static let stateDefaults = UserDefaults(suiteName: "com.openwearables.healthsdk.state") ?? .standard
+
+    /// The zones this phone has been in; gives a sample without a stored zone its offset.
+    /// Kept across sign-out: it describes the device, not the user.
+    internal var zoneLog = ZoneLog(defaults: OpenWearablesHealthSDK.stateDefaults)
+    private var timeZoneObserver: NSObjectProtocol?
 
     /// Overrides the root the SDK keeps its on-disk state under. Production leaves this
     /// nil and resolves to Application Support; tests point it at a temporary directory
@@ -353,6 +359,15 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         fgCfg.timeoutIntervalForResource = 600
         fgCfg.waitsForConnectivity = false
         self.foregroundSession = URLSession(configuration: fgCfg, delegate: nil, delegateQueue: OperationQueue.main)
+
+        // Note the phone's zone now and whenever it changes while the app is alive, so a
+        // sample recorded before a trip is not sent with the zone of the arrival.
+        zoneLog.record(.autoupdatingCurrent, at: Date())
+        timeZoneObserver = NotificationCenter.default.addObserver(
+            forName: .NSSystemTimeZoneDidChange, object: nil, queue: nil
+        ) { [weak self] _ in
+            self?.zoneLog.record(.autoupdatingCurrent, at: Date())
+        }
 
         if #available(iOS 13.0, *) {
             BGTaskScheduler.shared.register(forTaskWithIdentifier: refreshTaskId, using: nil) { [weak self] task in
@@ -1051,6 +1066,7 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
             logMessage("Escalating to full export (initial export not completed yet)")
         }
         
+        var startsNewFullExport = false
         if let state = existingState, state.fullExport == effectiveFullExport {
             if state.hasProgress {
                 logMessage("Resuming sync (fullExport: \(effectiveFullExport), \(state.totalSentCount) already sent, \(state.completedTypes.count) types done)")
@@ -1064,6 +1080,8 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
                 logMessage("Starting streaming sync (fullExport: \(effectiveFullExport), \(queryableTypes.count) types)")
             }
             _ = startNewSyncState(fullExport: effectiveFullExport, types: queryableTypes)
+            // A new full export sends the history: learn first which zones it was recorded in.
+            startsNewFullExport = effectiveFullExport
         }
         
         let syncStartTime = Date()
@@ -1107,6 +1125,25 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
             }
         }
         
+        if startsNewFullExport {
+            seedZoneHistory(types: queryableTypes) { [weak self] in
+                self?.startFullExportOrRoundRobin(
+                    fullExport: effectiveFullExport, types: queryableTypes, existingState: existingState, start: startRoundRobin
+                )
+            }
+        } else {
+            startFullExportOrRoundRobin(
+                fullExport: effectiveFullExport, types: queryableTypes, existingState: existingState, start: startRoundRobin
+            )
+        }
+    }
+
+    private func startFullExportOrRoundRobin(
+        fullExport effectiveFullExport: Bool,
+        types queryableTypes: [HKSampleType],
+        existingState: SyncState?,
+        start startRoundRobin: @escaping () -> Void
+    ) {
         if effectiveFullExport {
             let startDate = syncStartDate()
             let endDate = Date()
